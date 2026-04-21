@@ -24,6 +24,8 @@ Assets/
 │   │   ├── Combat/         HitboxController, HurtboxController, ComboSystem, ParrySystem,
 │   │   │                   DodgeSystem, DamageCalculator, StaggerMeter, InputBuffer
 │   │   ├── Buffs/          BuffManager, BuffVisualController, GameTickManager, ActiveBuff
+│   │   ├── Stats/          StatSheet, StatRegistry
+│   │   ├── Abilities/      AbilityBase, AbilityExecutionContext, AbilityModifierSO, EquipmentManager
 │   │   ├── Enemies/        EnemyAIBase, EnemyStateMachine, Bosses/, Variants/
 │   │   ├── World/          RoomManager, RoomTransition, WorldStateManager, AbilityGate
 │   │   ├── Cinematics/     CinematicDirector, LetterboxController
@@ -34,10 +36,12 @@ Assets/
 │   ├── Data/
 │   │   └── ScriptableObjects/
 │   │       ├── Abilities/
+│   │       ├── AbilityModifiers/
 │   │       ├── Buffs/
 │   │       ├── Enemies/
 │   │       ├── Combos/
 │   │       ├── Rooms/
+│   │       ├── Stats/
 │   │       └── ParrySettings/
 │   └── Art/, Audio/, Prefabs/, Animations/
 ```
@@ -145,8 +149,16 @@ CINEMATIC_KILL
 ### 3a. HitboxDataSO — Full Field List
 
 ```csharp
-// Damage
-float damage
+// Damage formula (Option 2 — multi-stat weighted)
+// FinalDamage = ((Strength * strengthWeight) + (Chi * chiWeight) + (WeaponDamage * weaponWeight))
+//               * baseMultiplier * levelScale * contextModifiers
+float strengthWeight                  // physical contribution (e.g. punch = 0.9, chi blast = 0.1)
+float chiWeight                       // chi/energy contribution (e.g. punch = 0.0, chi blast = 1.2)
+float weaponWeight                    // weapon contribution (e.g. sword strike = 0.8, kick = 0.0)
+float baseMultiplier                  // per-attack scalar (e.g. light = 0.8, flying kick = 1.4, finisher = 2.2)
+float armorPenetration                // 0.0–1.0, default 0 — fraction of target Armor ignored
+                                      // e.g. 0.5 = ignores half of target's armor
+
 float blockDamagePercent              // default 0.5 — damage dealt through block
 bool  isUnblockable                   // bypasses block entirely, full damage, guard break
 bool  piercesDodgeIFrames             // default false — i-frames don't protect; dodge movement still occurs
@@ -236,10 +248,15 @@ else if (PARRY_ACTIVE)
   → 0 damage, enemy staggered, parryStaggerDamage
 
 else if (BLOCKING)
-  → damage * blockDamagePercent
+  → RawDamage = damage * blockDamagePercent
 
 else
-  → full damage, staggerDamage
+  → RawDamage = full damage, staggerDamage
+
+// Armor applied last, after all parry/block resolution, for both player and enemy targets:
+EffectiveArmor = targetStats.Armor * (1 - attack.armorPenetration)
+FinalDamage    = max(1, RawDamage - EffectiveArmor)
+// max(1) ensures at least 1 damage always lands — attacks never feel completely negated
 ```
 
 ---
@@ -487,6 +504,170 @@ On remove:
 
 Multiple simultaneous buffs are handled by priority order or additive blending (configurable
 per `BuffVisualEffectSO`).
+
+---
+
+### 3i. Stat System
+
+Stats are split into two categories: **primary stats** (innate to the character, grow via
+levelling and upgrades) and **equipment stats** (contributed by equipped items). Both feed
+into derived values used at runtime by the damage formula, health system, and chi pool.
+
+#### Primary Stats
+
+| Stat | Intent |
+|---|---|
+| `Strength` | Scales physical attack damage — punches, kicks, weapon strikes |
+| `Chi` | Scales chi/energy attack damage; also governs max chi pool size |
+| `Dexterity` | Affects attack speed — animation playback rate, recovery frame reduction, combo window timing |
+| `Constitution` | Governs max health pool size |
+
+#### Equipment Stats (player only — sourced from equipped items, not innate)
+
+| Stat | Intent |
+|---|---|
+| `WeaponDamage` | Flat damage contribution from the equipped weapon; 0 when unarmed |
+| `Armor` | Flat damage reduction applied to incoming hits; 0 when no armor equipped |
+
+> **Enemies** do not have an inventory. Both `WeaponDamage` and `Armor` are native stats
+> on `EnemyDataSO`, authored directly in the Inspector alongside Strength, Chi, etc.
+
+#### Derived Stats (computed, never set directly)
+
+| Derived | Formula (intent — coefficients TBD during balancing) |
+|---|---|
+| `MaxHealth` | f(Constitution, Level) |
+| `MaxChiPool` | f(Chi, Level) |
+| `AttackSpeedMultiplier` | f(Dexterity) — scales animation speed and shortens recovery frames |
+| `LevelScale` | f(Level) — global damage scalar applied to all attacks |
+
+#### StatSheet
+
+`StatSheet` is a component on the player (and on enemies for their own damage formulas).
+It holds the raw primary stat values and exposes computed derived values as properties.
+Equipment bonuses are aggregated into a separate `equipmentBonuses` struct and added
+on top at read time — equipping and unequipping items never mutates base stats.
+
+```csharp
+// Primary (base values, modified by level-up and permanent upgrades)
+int strength
+int chi
+int dexterity
+int constitution
+int level
+
+// Equipment overlay (player only — aggregated from all equipped items by EquipmentManager)
+// Enemies leave this zeroed out; their WeaponDamage and Armor are set directly as native stats
+StatBonus equipmentBonuses     // additive on top of base stats
+                               // contains: weaponDamage, armor (and future equipment stats)
+
+// Derived (computed properties)
+float MaxHealth
+float MaxChiPool
+float AttackSpeedMultiplier
+float LevelScale
+int   WeaponDamage             // player: from equipmentBonuses; enemy: native stat, set directly
+int   Armor                    // player: from equipmentBonuses; enemy: native stat, set directly
+```
+
+`StatSheet` broadcasts `OnStatsChanged` via EventBus whenever any value changes, allowing
+health bars, chi bars, and UI to react without polling.
+
+---
+
+### 3j. Ability Execution Pipeline
+
+Abilities are fully data-driven and unaware of how equipment or upgrades might modify them.
+At execution time, a default context is built from the ability's own data, passed through
+a modifier pipeline registered by `EquipmentManager`, and then executed against the
+final mutated values.
+
+#### AbilityExecutionContext
+
+Plain mutable C# class (not a ScriptableObject — created and discarded per execution):
+
+```csharp
+// Damage formula inputs (defaults from AbilitySO / HitboxDataSO, freely mutable)
+float  strengthWeight
+float  chiWeight
+float  weaponWeight
+float  baseMultiplier
+int    hitCount                 // default 1 — AddHitModifier increments this
+float  armorPenetration         // 0.0–1.0, default from HitboxDataSO — equipment can raise this
+
+// Timing
+float  hitstunDuration          // can be extended or reduced by modifiers
+
+// On-hit effects
+List<BuffSO> onHitDebuffs       // applied to target on each hit
+BuffSO       selfBuffOnHit      // applied to caster on hit (null = none)
+
+// Read-only references (modifiers may read these to compute values)
+StatSheet    casterStats
+string       abilityId
+```
+
+#### AbilityModifierSO
+
+Abstract ScriptableObject. Item and upgrade designers subclass this — one class per modifier
+type. The ability pipeline calls `Modify(ctx)` on each registered modifier in order:
+
+```csharp
+public abstract void Modify(AbilityExecutionContext ctx);
+```
+
+**Example concrete modifier types:**
+
+| Class | What it does to context |
+|---|---|
+| `DamageMultiplierModifierSO` | `ctx.baseMultiplier *= multiplier` |
+| `AddHitModifierSO` | `ctx.hitCount += count` |
+| `ApplyDebuffOnHitModifierSO` | `ctx.onHitDebuffs.Add(debuff)` |
+| `ShiftStatWeightModifierSO` | adjusts chi/strength/weapon weights (e.g. make flying kick chi-scaled) |
+| `ExtendHitstunModifierSO` | `ctx.hitstunDuration += seconds` |
+| `ApplySelfBuffOnHitModifierSO` | `ctx.selfBuffOnHit = buff` |
+
+New modifier behaviors never require touching ability code — create a new subclass and assign
+it to an item asset.
+
+#### EquipmentManager
+
+Singleton (or ServiceLocator-resolved) component on the player. Owns the modifier registry
+and handles equip/unequip lifecycle:
+
+```csharp
+// Registry: abilityId → modifiers contributed by currently equipped items
+Dictionary<string, List<AbilityModifierSO>> modifiersByAbilityId
+
+void RegisterModifiers(EquipmentSO item)          // called on equip
+void UnregisterModifiers(EquipmentSO item)         // called on unequip
+
+// Called by ability at execution time
+AbilityExecutionContext BuildContext(string abilityId, AbilityExecutionContext defaults)
+```
+
+`BuildContext` clones `defaults`, iterates registered modifiers for `abilityId` in order,
+calls `Modify(ctx)` on each, and returns the final context. The ability never sees the
+modifier list — it just receives the finished context.
+
+#### Execution Flow
+
+```
+Player activates ability
+  → ability builds default AbilityExecutionContext from its own AbilitySO/HitboxDataSO data
+  → EquipmentManager.BuildContext(abilityId, defaults) called
+      → each registered AbilityModifierSO mutates context in order
+  → ability executes using final context values
+  → DamageCalculator.Compute(ctx, casterStats, targetStats) called per hit
+      → BaseDamage     = (Strength * ctx.strengthWeight)
+                       + (Chi * ctx.chiWeight)
+                       + (WeaponDamage * ctx.weaponWeight)
+      → RawDamage      = BaseDamage * ctx.baseMultiplier * LevelScale * blockModifier
+      → EffectiveArmor = targetStats.Armor * (1 - attack.armorPenetration)
+      → FinalDamage    = max(1, RawDamage - EffectiveArmor)
+      // applies identically whether target is player or enemy
+  → onHitDebuffs applied to target, selfBuffOnHit applied to caster
+```
 
 ---
 
@@ -752,7 +933,9 @@ explicitly.
 | 3 | `HitboxController.cs` / `HurtboxController.cs` | Damage pipeline |
 | 4 | `InputBuffer.cs` | Required before combo system |
 | 5 | `StaggerMeter.cs` | Required before combat tuning |
-| 6 | `GameTickManager.cs` | Required before any tick-based buff |
-| 7 | `BuffManager.cs` + `BuffVisualController.cs` | Required before dodge, abilities, or status effects |
-| 8 | `WorldStateManager.cs` | Room persistence and ability unlocks |
-| 9 | `CinematicDirector.cs` | Required before any boss content |
+| 6 | `StatSheet.cs` | Required before damage formula, health system, or chi pool |
+| 7 | `GameTickManager.cs` | Required before any tick-based buff |
+| 8 | `BuffManager.cs` + `BuffVisualController.cs` | Required before dodge, abilities, or status effects |
+| 9 | `EquipmentManager.cs` + `AbilityExecutionContext.cs` | Required before any ability executes damage |
+| 10 | `WorldStateManager.cs` | Room persistence and ability unlocks |
+| 11 | `CinematicDirector.cs` | Required before any boss content |
