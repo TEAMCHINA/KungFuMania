@@ -20,7 +20,8 @@ Assets/
 ├── _Project/
 │   ├── Scripts/
 │   │   ├── Core/           GameManager, EventBus, SceneLoader, ServiceLocator
-│   │   ├── Player/         PlayerController, PlayerStateMachine, PlayerCombat, PlayerAbilities, PlayerStats
+│   │   ├── Player/         PlayerController, PlayerStateMachine, PlayerCombat, PlayerAbilities, PlayerStats,
+│   │   │                   AnimatorSpeedSync
 │   │   ├── Combat/         HitboxController, HurtboxController, ComboSystem, ParrySystem,
 │   │   │                   DodgeSystem, DamageCalculator, StaggerMeter, InputBuffer
 │   │   ├── Buffs/          BuffManager, BuffVisualController, GameTickManager, ActiveBuff
@@ -41,7 +42,7 @@ Assets/
 │   │       ├── Enemies/
 │   │       ├── Combos/
 │   │       ├── Rooms/
-│   │       ├── Stats/
+│   │       ├── Stats/              StatConfigSO (dexterity coefficients, level scaling curve, etc.)
 │   │       └── ParrySettings/
 │   └── Art/, Audio/, Prefabs/, Animations/
 ```
@@ -519,7 +520,7 @@ into derived values used at runtime by the damage formula, health system, and ch
 |---|---|
 | `Strength` | Scales physical attack damage — punches, kicks, weapon strikes |
 | `Chi` | Scales chi/energy attack damage; also governs max chi pool size |
-| `Dexterity` | Affects attack speed — animation playback rate, recovery frame reduction, combo window timing |
+| `Dexterity` | Raw agility stat — drives AttackSpeedMultiplier and MovementSpeedMultiplier as computed properties |
 | `Constitution` | Governs max health pool size |
 
 #### Equipment Stats (player only — sourced from equipped items, not innate)
@@ -538,7 +539,8 @@ into derived values used at runtime by the damage formula, health system, and ch
 |---|---|
 | `MaxHealth` | f(Constitution, Level) |
 | `MaxChiPool` | f(Chi, Level) |
-| `AttackSpeedMultiplier` | f(Dexterity) — scales animation speed and shortens recovery frames |
+| `AttackSpeedMultiplier` | f(Dexterity) — read by `AnimatorSpeedSync` to set `animator.speed`; also scales recovery frame durations |
+| `MovementSpeedMultiplier` | f(Dexterity) — read by `PlayerController` to scale movement velocity |
 | `LevelScale` | f(Level) — global damage scalar applied to all attacks |
 
 #### StatSheet
@@ -561,13 +563,15 @@ int level
 StatBonus equipmentBonuses     // additive on top of base stats
                                // contains: weaponDamage, armor (and future equipment stats)
 
-// Derived (computed properties)
-float MaxHealth
-float MaxChiPool
-float AttackSpeedMultiplier
-float LevelScale
-int   WeaponDamage             // player: from equipmentBonuses; enemy: native stat, set directly
-int   Armor                    // player: from equipmentBonuses; enemy: native stat, set directly
+// Derived (computed properties — never set directly, always calculated from raw stats)
+float MaxHealth                  // => f(constitution, level)
+float MaxChiPool                 // => f(chi, level)
+float AttackSpeedMultiplier      // => 1f + (dexterity * attackSpeedCoefficient)
+float MovementSpeedMultiplier    // => 1f + (dexterity * movementSpeedCoefficient)
+float LevelScale                 // => f(level)
+int   WeaponDamage               // player: from equipmentBonuses; enemy: native stat, set directly
+int   Armor                      // player: from equipmentBonuses; enemy: native stat, set directly
+// coefficients are configurable on a StatConfigSO, not hardcoded
 ```
 
 `StatSheet` broadcasts `OnStatsChanged` via EventBus whenever any value changes, allowing
