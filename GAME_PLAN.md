@@ -1,4 +1,4 @@
-# Kung Fu Mania — Full Architecture Plan
+﻿# Kung Fu Mania — Full Architecture Plan
 
 ---
 
@@ -24,7 +24,7 @@ Assets/
 │   │   │                   AnimatorSpeedSync
 │   │   ├── Combat/         HitboxController, HurtboxController, ComboSystem, ParrySystem,
 │   │   │                   DodgeSystem, DamageCalculator, StaggerMeter, InputBuffer
-│   │   ├── Buffs/          BuffManager, BuffVisualController, GameTickManager, ActiveBuff
+│   │   ├── Auras/          AuraManager, AuraVisualController, GameTickManager, ActiveAura
 │   │   ├── Stats/          StatSheet, StatRegistry
 │   │   ├── Abilities/      AbilityBase, AbilityExecutionContext, AbilityModifierSO, EquipmentManager
 │   │   ├── Enemies/        EnemyAIBase, EnemyStateMachine, Bosses/, Variants/
@@ -38,7 +38,7 @@ Assets/
 │   │   └── ScriptableObjects/
 │   │       ├── Abilities/
 │   │       ├── AbilityModifiers/
-│   │       ├── Buffs/
+│   │       ├── Auras/
 │   │       ├── Enemies/
 │   │       ├── Combos/
 │   │       ├── Rooms/
@@ -391,7 +391,7 @@ int   recoveryFrames
 bool   perfectDodgeBulletTime          // default true
 float  perfectDodgeTimeScale           // e.g. 0.2
 float  perfectDodgeZoomAmount          // Cinemachine FOV delta
-BuffSO perfectDodgeBuff                // buff applied on perfect dodge (assigned in Inspector)
+AuraSO perfectDodgeAura                // aura applied on perfect dodge (assigned in Inspector)
 ```
 
 - I-frames disable the player `HurtboxController` for the configured window. Attacks with
@@ -410,68 +410,68 @@ On perfect dodge:
 PERFECT_DODGE state entered
   → timeScale drops to perfectDodgeTimeScale (if perfectDodgeBulletTime = true)
   → Cinemachine zooms by perfectDodgeZoomAmount
-  → BuffManager.ApplyBuff(perfectDodgeBuff) on player
+  → AuraManager.ApplyAura(perfectDodgeAura) on player
   → dodge animation completes at reduced timescale
   → timescale and camera restore
   → DODGE_RECOVERY
 ```
 
-The buff's own `duration` governs the follow-up window. Any unlocked ability that requires
-the buff checks `BuffManager.HasBuff()` independently — the dodge system has no knowledge
+The aura's own `duration` governs the follow-up window. Any unlocked ability that requires
+the aura checks `AuraManager.HasAura()` independently — the dodge system has no knowledge
 of what consumes it.
 
 ---
 
-### 3h. Buff / Debuff System
+### 3h. Aura System
 
-Buffs and debuffs share the same architecture — a `BuffSO` with positive or negative effects,
-applied to any entity carrying a `BuffManager` component (player, enemy, boss).
+Auras share the same architecture — a `AuraSO` with positive or negative effects,
+applied to any entity carrying a `AuraManager` component (player, enemy, boss).
 
-### BuffSO — Base Fields
+### AuraSO — Base Fields
 
 ```csharp
-string    buffId                 // unique identifier, used for HasBuff() checks
+string    auraId                 // unique identifier, used for HasAura() checks
 string    displayName
 Sprite    icon
 float     duration               // seconds; -1 = permanent until explicitly removed
 bool      stackable              // can multiple instances apply simultaneously
 int       maxStacks
-bool      isDebuff               // cosmetic flag for UI tinting, not logic
-BuffVisualEffectSO visualEffect  // null = no visual change
+bool      isNegative               // cosmetic flag for UI tinting, not logic
+AuraVisualEffectSO visualEffect  // null = no visual change
 ```
 
-Each `BuffSO` is self-contained. It subscribes to EventBus events **when applied** and
-unsubscribes **when removed**. `BuffManager` owns the active list and lifetime — it does
-not need to know what any individual buff does.
+Each `AuraSO` is self-contained. It subscribes to EventBus events **when applied** and
+unsubscribes **when removed**. `AuraManager` owns the active list and lifetime — it does
+not need to know what any individual aura does.
 
 **Trigger examples:**
 ```
-PoisonDebuffSO          → OnGameTick — deals damage every 10 ticks
-DamageBoostBuffSO       → OnPlayerAttackLanded — applies damage multiplier for duration
-PerfectDodgeReadyBuffSO → expires by duration; abilities poll HasBuff() each frame
-BlockBreakDebuffSO      → OnPlayerHit — increases damage taken temporarily
+PoisonAuraSO          → OnGameTick — deals damage every 10 ticks
+DamageBoostAuraSO       → OnPlayerAttackLanded — applies damage multiplier for duration
+PerfectDodgeReadyAuraSO → expires by duration; abilities poll HasAura() each frame
+BlockBreakAuraSO      → OnPlayerHit — increases damage taken temporarily
 ```
 
-### BuffManager
+### AuraManager
 
-Component on any entity that can receive buffs (player, enemies, bosses):
+Component on any entity that can receive auras (player, enemies, bosses):
 
 ```csharp
-List<ActiveBuff> activeBuffs    // runtime: BuffSO + remaining duration + stack count
+List<ActiveAura> activeAuras    // runtime: AuraSO + remaining duration + stack count
 
-void ApplyBuff(BuffSO)          // adds instance, buff subscribes to its triggers
-void RemoveBuff(string buffId)  // removes instance, buff unsubscribes
-bool HasBuff(string buffId)     // queried by abilities, DamageCalculator, AI, etc.
+void ApplyAura(AuraSO)          // adds instance, aura subscribes to its triggers
+void RemoveAura(string auraId)  // removes instance, aura unsubscribes
+bool HasAura(string auraId)     // queried by abilities, DamageCalculator, AI, etc.
 ```
 
 Broadcasts via EventBus:
-- `OnBuffApplied(buffId)` — for UI, audio, visual controller
-- `OnBuffRemoved(buffId)` — for UI, visual controller cleanup
-- `OnBuffStackChanged(buffId, stacks)` — for UI stack indicators
+- `OnAuraApplied(auraId)` — for UI, audio, visual controller
+- `OnAuraRemoved(auraId)` — for UI, visual controller cleanup
+- `OnAuraStackChanged(auraId, stacks)` — for UI stack indicators
 
 ### GameTickManager
 
-Lightweight singleton that fires `OnGameTick` at a fixed interval. Tick-based buffs subscribe
+Lightweight singleton that fires `OnGameTick` at a fixed interval. Tick-based auras subscribe
 here rather than `Update`, keeping effects deterministic and frame-rate independent.
 
 ```csharp
@@ -479,10 +479,10 @@ int tickIntervalFrames    // FixedUpdate frames per game tick (e.g. 4)
 event Action OnGameTick   // broadcast via EventBus
 ```
 
-### BuffVisualEffectSO
+### AuraVisualEffectSO
 
-Assigned per buff in the Inspector. `BuffVisualController` (component on the player and any
-enemy that can receive visible buffs) listens to `OnBuffApplied` / `OnBuffRemoved` and
+Assigned per aura in the Inspector. `AuraVisualController` (component on the player and any
+enemy that can receive visible auras) listens to `OnAuraApplied` / `OnAuraRemoved` and
 drives the visual response.
 
 ```csharp
@@ -492,7 +492,7 @@ GameObject particlePrefab        // optional looping particle effect, spawned as
 float      pulseSpeed            // > 0 = tint pulses rather than being static
 ```
 
-**`BuffVisualController`** on apply:
+**`AuraVisualController`** on apply:
 - Lerps `SpriteRenderer.color` to `spriteColorTint`
 - Swaps material if `materialOverride` is set (via `material.SetColor()` at runtime for
   shader-driven glow intensity)
@@ -503,8 +503,8 @@ On remove:
 - Restores original material
 - Destroys particle instance
 
-Multiple simultaneous buffs are handled by priority order or additive blending (configurable
-per `BuffVisualEffectSO`).
+Multiple simultaneous auras are handled by priority order or additive blending (configurable
+per `AuraVisualEffectSO`).
 
 ---
 
@@ -603,8 +603,8 @@ float  armorPenetration         // 0.0–1.0, default from HitboxDataSO — equi
 float  hitstunDuration          // can be extended or reduced by modifiers
 
 // On-hit effects
-List<BuffSO> onHitDebuffs       // applied to target on each hit
-BuffSO       selfBuffOnHit      // applied to caster on hit (null = none)
+List<AuraSO> onHitAuras       // applied to target on each hit
+AuraSO       selfAuraOnHit      // applied to caster on hit (null = none)
 
 // Read-only references (modifiers may read these to compute values)
 StatSheet    casterStats
@@ -626,10 +626,10 @@ public abstract void Modify(AbilityExecutionContext ctx);
 |---|---|
 | `DamageMultiplierModifierSO` | `ctx.baseMultiplier *= multiplier` |
 | `AddHitModifierSO` | `ctx.hitCount += count` |
-| `ApplyDebuffOnHitModifierSO` | `ctx.onHitDebuffs.Add(debuff)` |
+| `ApplyAuraOnHitModifierSO` | `ctx.onHitAuras.Add(aura)` |
 | `ShiftStatWeightModifierSO` | adjusts chi/strength/weapon weights (e.g. make flying kick chi-scaled) |
 | `ExtendHitstunModifierSO` | `ctx.hitstunDuration += seconds` |
-| `ApplySelfBuffOnHitModifierSO` | `ctx.selfBuffOnHit = buff` |
+| `ApplySelfAuraOnHitModifierSO` | `ctx.selfAuraOnHit = aura` |
 
 New modifier behaviors never require touching ability code — create a new subclass and assign
 it to an item asset.
@@ -670,7 +670,7 @@ Player activates ability
       → EffectiveArmor = targetStats.Armor * (1 - attack.armorPenetration)
       → FinalDamage    = max(1, RawDamage - EffectiveArmor)
       // applies identically whether target is player or enemy
-  → onHitDebuffs applied to target, selfBuffOnHit applied to caster
+  → onHitAuras applied to target, selfAuraOnHit applied to caster
 ```
 
 ---
@@ -938,8 +938,8 @@ explicitly.
 | 4 | `InputBuffer.cs` | Required before combo system |
 | 5 | `StaggerMeter.cs` | Required before combat tuning |
 | 6 | `StatSheet.cs` | Required before damage formula, health system, or chi pool |
-| 7 | `GameTickManager.cs` | Required before any tick-based buff |
-| 8 | `BuffManager.cs` + `BuffVisualController.cs` | Required before dodge, abilities, or status effects |
+| 7 | `GameTickManager.cs` | Required before any tick-based aura |
+| 8 | `AuraManager.cs` + `AuraVisualController.cs` | Required before dodge, abilities, or status effects |
 | 9 | `EquipmentManager.cs` + `AbilityExecutionContext.cs` | Required before any ability executes damage |
 | 10 | `WorldStateManager.cs` | Room persistence and ability unlocks |
 | 11 | `CinematicDirector.cs` | Required before any boss content |
