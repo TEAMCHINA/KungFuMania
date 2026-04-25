@@ -27,8 +27,9 @@ Assets/
 │   │   ├── Auras/          AuraManager, AuraVisualController, GameTickManager, ActiveAura
 │   │   ├── Stats/          StatSheet, StatRegistry
 │   │   ├── Abilities/      AbilityBase, AbilityExecutionContext, AbilityModifierSO, EquipmentManager
+│   │   ├── MovementAbilities/ DoubleJumpAbility, AirDashAbility, GrappleAbility
 │   │   ├── Enemies/        EnemyAIBase, EnemyStateMachine, Bosses/, Variants/
-│   │   ├── World/          RoomManager, RoomTransition, WorldStateManager, AbilityGate
+│   │   ├── World/          RoomManager, RoomTransition, WorldStateManager, AbilityGate, GrapplePoint
 │   │   ├── Cinematics/     CinematicDirector, LetterboxController
 │   │   ├── Input/          InputReader (ScriptableObject)
 │   │   ├── Audio/          AudioManager, MusicController, SFXCatalog
@@ -675,6 +676,89 @@ Player activates ability
 
 ---
 
+### 3k. Movement Ability Plugin System
+
+Movement abilities follow the same philosophy as `AbilityModifierSO` — they are
+self-contained components; the base player systems have no knowledge of them. Each ability
+is a `MonoBehaviour` added to the player prefab. The ability checks its own unlock condition,
+manages its own state, and calls exposed hooks on `PlayerController` to affect movement.
+
+Adding a new movement ability never requires touching `PlayerStateMachine` or
+`PlayerController`.
+
+#### PlayerController Hooks
+
+`PlayerController` exposes a minimal set of hooks. It has no knowledge of which ability
+components are installed:
+
+```csharp
+void    ApplyImpulse(Vector2 force)             // adds velocity — double jump, air dash, grapple pull
+void    ForceLocomotionState(string stateId)    // overrides current locomotion state
+Vector2 GetVelocity()                           // read current velocity
+bool    IsGrounded()                            // ground contact query
+bool    IsAirborne()                            // convenience inverse
+```
+
+#### Double Jump (`DoubleJumpAbility`)
+
+```csharp
+int   maxExtraJumps       // default 1; an upgrade could raise this
+int   remainingJumps      // reset to maxExtraJumps via OnPlayerLanded EventBus event
+float jumpImpulseForce
+```
+
+- Listens to `OnJump` from `InputReader`
+- Only acts when `IsAirborne()` and `remainingJumps > 0`
+- Calls `playerController.ApplyImpulse(Vector2.up * jumpImpulseForce)`
+- Decrements `remainingJumps`; resets on `OnPlayerLanded`
+
+#### Air Dash (`AirDashAbility`)
+
+```csharp
+int     maxAirDashes        // default 1
+int     remainingAirDashes  // reset on landing
+DodgeSO airDashData         // reuses existing DodgeSO — same i-frames, speed curve, recovery
+```
+
+- Listens to `OnDodge` from `InputReader`
+- Only acts when `IsAirborne()` and `remainingAirDashes > 0`
+- Delegates entirely to `DodgeSystem` using `airDashData`
+- Same i-frame and perfect dodge logic applies unchanged
+- Charges reset via `OnPlayerLanded`
+
+#### Grapple / Hookshot (`GrappleAbility` — `WIRE_FU`)
+
+Implemented as a strong directional pull — no pendulum physics, no new locomotion states.
+`JUMP` and `FALL` handle the player throughout; the ability stays a pure plugin.
+
+```csharp
+float     maxGrappleRange
+LayerMask grapplePointLayer
+float     launchImpulse          // strength of the pull toward the anchor point
+float     releaseRedirectStrength // optional velocity nudge on release based on approach angle
+```
+
+On `OnGrapple` input:
+```
+1. Raycast/overlap for nearest active GrapplePoint within maxGrappleRange
+2. If found → ApplyImpulse(directionToPoint * launchImpulse)
+              player flies toward anchor through normal JUMP/FALL states
+3. On reaching anchor (proximity check) or second OnGrapple press
+   → optionally ApplyImpulse(redirectVector * releaseRedirectStrength)
+   → normal aerial locomotion resumes with carried momentum
+```
+
+No joint physics, no state overrides, no locomotion lock. The feel is a snappy wuxia wire
+launch rather than a pendulum swing — fast, directional, releases cleanly into aerial attacks.
+
+**`GrapplePoint`** — simple component on world anchor rings:
+
+```csharp
+bool isActive    // can be toggled (e.g. a boss destroys anchor rings as a phase attack)
+```
+
+---
+
 ## 4. Metroidvania Map / Scene Management
 
 ### Scene Structure
@@ -820,6 +904,7 @@ event Action          OnInteract
 event Action          OnPause
 event Action          OnAbility1
 event Action          OnAbility2
+event Action          OnGrapple             // WIRE_FU — fire/release grapple line
 ```
 
 `OnDefensiveHold` is not needed — block state is entered when press is outside the parry
@@ -926,6 +1011,11 @@ happens in the Inspector, not in code.
 events are blocked or queued. `CinematicDirector` is the sole authority and signals completion
 explicitly.
 
+**Movement abilities as plugins.** Movement abilities (double jump, air dash, grapple) are
+self-contained `MonoBehaviour` components that call hooks on `PlayerController`. The base
+player systems have no knowledge of installed abilities. Adding a new movement ability is
+adding a component — no changes to `PlayerStateMachine` or `PlayerController`.
+
 ---
 
 ## 12. Build Order (Critical Path)
@@ -941,5 +1031,6 @@ explicitly.
 | 7 | `GameTickManager.cs` | Required before any tick-based aura |
 | 8 | `AuraManager.cs` + `AuraVisualController.cs` | Required before dodge, abilities, or status effects |
 | 9 | `EquipmentManager.cs` + `AbilityExecutionContext.cs` | Required before any ability executes damage |
-| 10 | `WorldStateManager.cs` | Room persistence and ability unlocks |
-| 11 | `CinematicDirector.cs` | Required before any boss content |
+| 10 | `PlayerController` hooks (`ApplyImpulse`, `ForceLocomotionState`, etc.) | Required before any movement ability component |
+| 11 | `WorldStateManager.cs` | Room persistence and ability unlocks |
+| 12 | `CinematicDirector.cs` | Required before any boss content |
