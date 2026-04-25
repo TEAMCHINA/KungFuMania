@@ -23,7 +23,8 @@ Assets/
 │   │   ├── Player/         PlayerController, PlayerStateMachine, PlayerCombat, PlayerAbilities, PlayerStats,
 │   │   │                   AnimatorSpeedSync
 │   │   ├── Combat/         HitboxController, HurtboxController, ComboSystem, ParrySystem,
-│   │   │                   DodgeSystem, DamageCalculator, StaggerMeter, InputBuffer
+│   │   │                   DodgeSystem, DamageCalculator, StaggerMeter, InputBuffer,
+│   │   │                   MotionInputBuffer, MotionInputDetector
 │   │   ├── Auras/          AuraManager, AuraVisualController, GameTickManager, ActiveAura
 │   │   ├── Stats/          StatSheet, StatRegistry
 │   │   ├── Abilities/      AbilityBase, AbilityExecutionContext, AbilityModifierSO, EquipmentManager
@@ -39,6 +40,7 @@ Assets/
 │   │   └── ScriptableObjects/
 │   │       ├── Abilities/
 │   │       ├── AbilityModifiers/
+│   │       ├── MotionInputs/       MotionPatternSO assets, StickInputConfigSO
 │   │       ├── Auras/
 │   │       ├── Enemies/
 │   │       ├── Combos/
@@ -759,6 +761,142 @@ bool isActive    // can be toggled (e.g. a boss destroys anchor rings as a phase
 
 ---
 
+### 3l. Motion Input System
+
+Fighting game-style directional sequences (quarter circles, half circles, etc.) as learnable
+abilities. Detection is entirely separate from the combo system — different buffer, different
+SO type, different detector. Once a motion is matched it fires through the existing
+`AbilityExecutionContext` pipeline identically to any other ability.
+
+#### Advanced Combat Mode
+
+Holding the assigned button (e.g. left bumper) sets one flag on `PlayerController`:
+
+```csharp
+bool advancedCombatActive
+// in movement update: if (!advancedCombatActive) { UpdateFacing(moveInput); }
+```
+
+While active:
+- Facing direction is locked — the character won't turn around during stick rotations
+- `MotionInputDetector` processes action button presses against motion patterns
+- Movement speed is unchanged
+
+The `ADVANCED_COMBAT` ability must be unlocked before the button does anything.
+Pressing it before unlock has no effect — the flag simply never sets.
+
+#### Analog Stick → Zone Mapping
+
+The raw stick `Vector2` is converted to a single integer zone every frame before reaching
+the buffer. Two steps:
+
+**1. Dead zone check**
+If `stick.magnitude < zoneDeadzone` → zone 5 (neutral). Prevents drift registering as input.
+
+**2. Angle-based sector snap**
+Beyond the dead zone, `atan2(y, x)` maps the stick to one of 8 sectors:
+
+```
+     8 (90°)
+  7     9
+4    5    6
+  1     3
+     2 (270°)
+```
+
+Each sector is centered on its angle. Default sector width is **45°** per zone.
+Setting cardinal zones to **50°** (diagonals shrink to 40°) makes quarter circles more
+forgiving — a tuning value on `StickInputConfigSO`, not a code change.
+
+The decimal stick position is consumed here and never reaches the buffer. All downstream
+motion detection reasons purely in integers.
+
+#### MotionInputBuffer
+
+A separate circular buffer from `InputBuffer` (which handles combo chaining). Runs
+continuously, recording one entry per zone change:
+
+```csharp
+struct MotionZoneEntry {
+    int   zone
+    float enteredAt    // Time.time when this zone was entered
+    float exitedAt     // Time.time when zone was exited (0 if still active)
+}
+
+int   bufferSize     // entries to retain (e.g. 32)
+float zoneDeadzone   // magnitude threshold for neutral (zone 5)
+```
+
+An entry is only written when the zone changes — prevents flickering between adjacent
+zones from polluting the buffer.
+
+#### MotionPatternSO
+
+Each step carries a zone group rather than a single zone, and an optional minimum hold
+duration for charge inputs. Defines one learnable ability as a data asset — no code per ability:
+
+```csharp
+struct MotionStep {
+    int[]  zones             // any zone in this array satisfies the step
+    float  minHoldDuration   // 0 = transition (pass-through); > 0 = charge (must hold)
+}
+
+MotionStep[] sequence        // ordered steps
+InputAction  confirmButton   // OnAttackLight, OnAttackHeavy, OnAbility1, etc.
+float        maxStepInterval // max seconds allowed between each step
+string       abilityId       // passed into AbilityExecutionContext pipeline on match
+```
+
+**Zone groups decouple intent from exact position.** `zones=[1,4,7]` means "any back
+direction" — the player can hold straight back, down-back, or up-back interchangeably.
+Diagonal zones naturally carry both their axis components, matching Guile-style flexibility
+at no extra cost.
+
+**Common patterns:**
+
+| Name | Steps | Shorthand |
+|---|---|---|
+| Quarter Circle Forward | [2,3]→[3,6]→[6] | QCF |
+| Dragon Punch | [6]→[2,3]→[3,6] | DP |
+| Quarter Circle Back | [2,1]→[1,4]→[4] | QCB |
+| Half Circle Back | [6,3]→[3,2]→[2,1]→[1,4]→[4] | HCB |
+| Sonic Boom (charge) | [1,4,7] hold 1.2s → [6,3,9] | CB→F |
+| Flash Kick (charge) | [1,2,3] hold 1.2s → [7,8,9] | CD→U |
+| Back Back Forward | [4,1,7]→[4,1,7]→[6,3,9] | BBF |
+
+#### MotionInputDetector
+
+Component on the player. Only evaluates when `advancedCombatActive = true`.
+
+**Pattern matching uses skip mode** — when scanning the buffer backwards for a step, any
+entry whose zone is not in `step.zones` is skipped transparently. Only entries that satisfy
+the current step advance the match. This means intermediate directions between repeated
+steps (e.g. `4→2→4→6` satisfying `BBF`) are ignored naturally — the only requirement is
+that matching zones appear in order within `maxStepInterval`.
+
+**Charge detection** sums the `exitedAt - enteredAt` durations of all contiguous buffer
+entries where `zone ∈ step.zones`. This handles stick drift between valid charge zones
+(e.g. wandering between zone 4 and zone 1 while holding back) without breaking the charge.
+
+On any action button press:
+```
+1. Check advancedCombatActive — if false, skip entirely
+2. Filter registered MotionPatternSOs by confirmButton
+3. For each candidate, walk buffer backwards in skip mode:
+   a. For each step, scan backwards skipping non-matching entries
+   b. For charge steps: sum durations of contiguous same-group entries,
+      verify total >= minHoldDuration
+   c. Verify time between matched entries <= maxStepInterval
+4. Match found → fire ability through AbilityExecutionContext pipeline, consume input
+5. No match → input falls through to ComboSystem as a normal attack
+```
+
+Fall-through is important — pressing punch without a valid motion still performs a normal
+attack. Players who haven't unlocked `ADVANCED_COMBAT`, or who aren't holding the button,
+experience zero difference from the base combat system.
+
+---
+
 ## 4. Metroidvania Map / Scene Management
 
 ### Scene Structure
@@ -816,6 +954,8 @@ room load and on `OnAbilityUnlocked` events. Opens with an animation and disable
 - `HIGH_KICK` (breaks cracked ceilings)
 - `IRON_BODY` (withstands environmental hazards)
 - `WIRE_FU` (grapple to ceiling anchor rings)
+- `ADVANCED_COMBAT` (unlocks advanced combat mode + motion input detection)
+- Additional motion input abilities defined via `MotionPatternSO` — no code required per ability
 
 ---
 
@@ -904,7 +1044,9 @@ event Action          OnInteract
 event Action          OnPause
 event Action          OnAbility1
 event Action          OnAbility2
-event Action          OnGrapple             // WIRE_FU — fire/release grapple line
+event Action          OnGrapple                    // WIRE_FU — fire/release grapple line
+event Action          OnAdvancedCombatPressed      // hold to enter advanced combat mode
+event Action          OnAdvancedCombatReleased     // release to exit
 ```
 
 `OnDefensiveHold` is not needed — block state is entered when press is outside the parry
@@ -1016,6 +1158,12 @@ self-contained `MonoBehaviour` components that call hooks on `PlayerController`.
 player systems have no knowledge of installed abilities. Adding a new movement ability is
 adding a component — no changes to `PlayerStateMachine` or `PlayerController`.
 
+**Motion inputs are detection-layer only.** `MotionInputBuffer` and `MotionInputDetector`
+are entirely separate from `InputBuffer` and `ComboSystem`. A matched motion fires through
+the same `AbilityExecutionContext` pipeline as every other ability. New motion abilities are
+`MotionPatternSO` assets — no code required. Unmatched inputs fall through to the combo
+system transparently.
+
 ---
 
 ## 12. Build Order (Critical Path)
@@ -1032,5 +1180,6 @@ adding a component — no changes to `PlayerStateMachine` or `PlayerController`.
 | 8 | `AuraManager.cs` + `AuraVisualController.cs` | Required before dodge, abilities, or status effects |
 | 9 | `EquipmentManager.cs` + `AbilityExecutionContext.cs` | Required before any ability executes damage |
 | 10 | `PlayerController` hooks (`ApplyImpulse`, `ForceLocomotionState`, etc.) | Required before any movement ability component |
-| 11 | `WorldStateManager.cs` | Room persistence and ability unlocks |
-| 12 | `CinematicDirector.cs` | Required before any boss content |
+| 11 | `MotionInputBuffer.cs` + `MotionInputDetector.cs` | Required before any motion input ability |
+| 12 | `WorldStateManager.cs` | Room persistence and ability unlocks |
+| 13 | `CinematicDirector.cs` | Required before any boss content |
