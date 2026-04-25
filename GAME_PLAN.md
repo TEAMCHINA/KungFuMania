@@ -84,11 +84,16 @@ moving or jumping without combinatorial state explosion.
 
 ```
 IDLE → WALK → RUN → JUMP → FALL → WALL_SLIDE → CROUCH → BLOCKING → HURT
+                                                                   → DOWN → DOWN_RECOVERY
 ```
 
 `BLOCKING` is a held locomotion state entered when the defensive button is held and no parry
 triggered on the initial press (see Combat System). Player can move slowly while blocking
 (configurable). Releasing exits back to the appropriate locomotion state.
+
+`DOWN` is entered when a knockdown attack lands (see 3a `onHitTargetState` and 3m).
+`DOWN_RECOVERY` is the get-up animation; input during DOWN can trigger an early tech roll
+that skips to a brief neutral recovery stance instead.
 
 #### Combat Layer
 
@@ -119,6 +124,7 @@ Each combat state is authored as a ScriptableObject containing:
 PATROL → DETECT → CHASE → ATTACK sub-states
                          → ATTACK_RECOVERY (after every attack, before next action)
                          → STAGGERED (stagger bar filled)
+                         → DOWN → DOWN_RECOVERY (knockdown attacks)
                          → GUARD / GUARD_BREAK  (canBlock enemies only)
                          → DEATH
 ```
@@ -127,6 +133,19 @@ PATROL → DETECT → CHASE → ATTACK sub-states
 into another attack until it completes. Duration is defined per attack in `AttackPatternSO`
 via `attackRecoveryFrames`. This prevents enemies from attacking and immediately retreating
 into a guard, and is what makes parry counters always land cleanly.
+
+#### AttackPatternSO — Key Fields
+
+```csharp
+HitboxDataSO hitboxData              // damage, parry windows, stagger values
+AnimationClip attackAnimation
+int     attackRecoveryFrames         // mandatory cooldown after the attack completes
+bool    superArmor                   // default false — taking damage does not interrupt;
+                                     // full damage applies, stagger builds normally;
+                                     // stagger bar filling is the ONLY interrupt — see 3d
+float   usageWeight                  // relative probability in weighted random selection
+float   lastUsedCooldown             // seconds before this attack can be selected again
+```
 
 **Blocking capability** is not universal. `EnemyDataSO` carries:
 
@@ -191,9 +210,43 @@ bool          perfectParryCounterBulletTime   // default false — triggers slow
 float         perfectParryCounterTimeScale    // e.g. 0.2 (only used if bulletTime = true)
 float         perfectParryCounterZoomAmount   // Cinemachine FOV delta (only used if bulletTime = true)
 
+// Target state precondition — checked before damage resolution; whiffs if not satisfied
+TargetStateRequirement targetRequirement  // default None — no restriction
+                                          // see enum below; use flags for multi-state attacks
+
+// On-hit result — determines which hurt state the target enters
+OnHitTargetState onHitTargetState        // default Hurt — see enum below
+
 // Feel
 float hitstunDuration
 Vector2 knockbackVector
+```
+
+**`TargetStateRequirement`** — C# flags enum, checked against target's current locomotion state:
+
+```csharp
+[System.Flags]
+enum TargetStateRequirement {
+    None      = 0,       // no restriction — hitbox lands against any state
+    Grounded  = 1 << 0,  // target must be grounded (not in JUMP/FALL/airborne)
+    Airborne  = 1 << 1,  // target must be airborne (JUMP or FALL)
+    Crouching = 1 << 2,  // target must be in CROUCH
+    Standing  = 1 << 3,  // target must be in IDLE/WALK/RUN (upright, not crouching, not airborne)
+    Downed    = 1 << 4,  // OTG — target must be in DOWN state; normal hits whiff vs. downed targets
+}
+// Flags can combine: Grounded | Standing means standing (not crouching, not airborne)
+// Omitting Downed from any Grounded attack means it won't auto-OTG — intentional default
+```
+
+**`OnHitTargetState`** — determines which state the target enters when hit:
+
+```csharp
+enum OnHitTargetState {
+    Hurt,       // standard hitstun — target enters HURT, plays pain animation
+    Down,       // knockdown — target enters DOWN (floor tumble/slide), then DOWN_RECOVERY
+    Launched,   // juggle starter — target enters FALL with strong upward knockback vector
+}
+// New states (Crumple, WallBounce, etc.) are added here without touching HitboxDataSO logic
 ```
 
 ---
@@ -235,6 +288,11 @@ float parryRecoveryDuration    // e.g. 0.4s — hold >= this = no lockout
 #### DamageCalculator Resolution Order
 
 ```
+// Precondition check — runs before any damage or state resolution:
+if (!attack.targetRequirement.Satisfies(target.currentLocomotionState))
+  → whiff; hitbox overlap is silently ignored; no damage, no stagger, no state change
+  // e.g. command throw whiffs vs. airborne; low sweep whiffs vs. jumping; OTG whiffs vs. standing
+
 if (isUnblockable && BLOCKING)
   → full damage + guard break animation
 
@@ -261,6 +319,17 @@ else
 EffectiveArmor = targetStats.Armor * (1 - attack.armorPenetration)
 FinalDamage    = max(1, RawDamage - EffectiveArmor)
 // max(1) ensures at least 1 damage always lands — attacks never feel completely negated
+
+// Interrupt resolution — runs after damage and stagger are applied:
+if (staggerBarJustFilled)
+  → STAGGERED — overrides super armor; deactivate all hitboxes immediately (no trade)
+else if (target.currentAttack.superArmor)
+  → animation continues; hurt state suppressed; damage and stagger already applied above
+else
+  → target enters attack.onHitTargetState:
+      Hurt     → HURT (standard hitstun)
+      Down     → DOWN (knockdown floor animation, then DOWN_RECOVERY)
+      Launched → FALL with upward knockback vector (juggle)
 ```
 
 ---
@@ -307,8 +376,22 @@ float staggeredDuration     // how long STAGGERED state lasts
 - Perfect parry: `parryStaggerDamage * perfectParryStaggerMultiplier`
 - Blocked hit: optional reduced stagger (e.g. `0.25x`), configurable
 
-On `currentStagger >= maxStagger`: enemy enters `STAGGERED` (animation locked, takes bonus
+On `currentStagger >= maxStagger`: entity enters `STAGGERED` (animation locked, takes bonus
 damage), bar resets to 0.
+
+#### Super Armor and Stagger
+
+An attack flagged `superArmor = true` (on `ComboStep` or `AttackPatternSO`) absorbs
+incoming damage without interrupting the animation. Every hit taken during the armor window
+still builds stagger normally. When the bar fills:
+
+1. `STAGGERED` fires immediately — armor breaks mid-attack with no delay
+2. All active hitboxes deactivate instantly — the hit that caused the stagger break does
+   **not** trade; the staggered entity cannot land their pending hit
+3. The capitalize window opens clean — punish without eating a counter-hit
+
+Super armor is a commitment mechanic, not a get-out-of-jail card. Opponents can race to
+fill the stagger bar rather than retreating.
 
 ---
 
@@ -331,6 +414,14 @@ AnimationClip animationOverride      // combo-specific animation variant
 // Cancels
 bool isDefensiveCancellable          // default true — parry/block press immediately interrupts
 bool isComboBufferCancellable        // default true — buffered combo input fires at cancellable frame
+bool canCancelIntoSpecial            // default false — attack can 2-in-1 cancel into a motion input
+                                     // special ON HIT only; requires advancedCombatActive naturally
+                                     // since specials already gate on it
+
+// Armor
+bool superArmor                      // default false — taking damage does not interrupt this attack
+                                     // full damage still applies; stagger still builds normally
+                                     // stagger bar filling is the ONLY interrupt — see 3d
 
 // Polish
 bool hasCinematicFlourish            // brief zoom / impact freeze on this step
@@ -354,6 +445,9 @@ rather than clinical.
 
 ```
 During any attack:
+  ├─ Damage received + superArmor = false → HURT state (attack cancelled immediately)
+  ├─ Damage received + superArmor = true  → damage/stagger applied; animation continues
+  │   (stagger bar filling overrides super armor → immediate STAGGERED, hitboxes off)
   ├─ Parry/block pressed + isDefensiveCancellable = true  → immediate defensive state
   ├─ Parry/block pressed + isDefensiveCancellable = false → ignored, attack plays out
   ├─ Buffered attack input present + isComboBufferCancellable = true → fire next combo step
@@ -363,6 +457,37 @@ During any attack:
 Heavy finishers, grab attacks, and special moves set `isDefensiveCancellable = false` —
 committing to them is a deliberate risk. Standard light/medium attacks default to cancellable,
 keeping the flow frenetic: **attack → attack → parry → counter → attack**.
+
+#### 2-in-1 Cancel (SF2-Style)
+
+When `canCancelIntoSpecial = true` on a `ComboStep`, the attack can be cancelled into a
+motion input special **on hit only**. This is the Street Fighter 2 "2-in-1" cancel — the
+special fires during the active or early recovery frames of the attack, but only if the
+hit actually connected.
+
+**How it works:**
+
+```
+Attack with canCancelIntoSpecial = true swings:
+  ├─ Hit connects (HurtboxController overlap confirmed)
+  │   → hitConnected flag set for this ComboStep
+  │   → MotionInputDetector checks buffer for a valid motion pattern
+  │     ├─ Pattern matched + advancedCombatActive = true → special fires, cancels recovery
+  │     └─ No match → attack plays out normally
+  └─ Whiff (no hit confirmed)
+      → canCancelIntoSpecial is ignored; attack plays to end
+```
+
+The `advancedCombatActive` requirement is **not an additional gate** — it is already
+enforced naturally, since only motion input specials are valid cancel targets, and those
+already require `advancedCombatActive` to detect. Players without `ADVANCED_COMBAT`
+unlocked simply cannot perform the cancel, with no extra logic needed.
+
+**Design intent:**
+- Whiff punishing is preserved — specials cannot be thrown out safely without landing
+- Rewards players who learn which normals cancel into which specials
+- Baked-in combo chains (`isComboBufferCancellable`) chain naturally and do not use this
+  system; 2-in-1 is exclusively for chaining a normal into a motion special mid-combo
 
 ---
 
@@ -894,6 +1019,58 @@ On any action button press:
 Fall-through is important — pressing punch without a valid motion still performs a normal
 attack. Players who haven't unlocked `ADVANCED_COMBAT`, or who aren't holding the button,
 experience zero difference from the base combat system.
+
+---
+
+### 3m. Knockdown State (DOWN)
+
+`DOWN` is a locomotion state entered when a hit resolves with `onHitTargetState = Down`.
+It replaces HURT entirely for the duration — the character is floored, not just reeling.
+
+#### State Flow
+
+```
+Hit with onHitTargetState = Down
+  → DOWN (floor tumble / slide animation plays, entity cannot act)
+    ├─ Tech input detected (any direction + jump during DOWN)
+    │    → DOWN_RECOVERY (brief neutral get-up stance, shorter than full recovery)
+    └─ No tech input → DOWN_RECOVERY (full get-up animation on timer)
+         → IDLE (resumes normal locomotion)
+```
+
+#### DOWN State Behavior
+
+- Entity is completely invulnerable to **normal** hits while downed — attacks with
+  `targetRequirement` that does not include `Downed` whiff even if hitboxes overlap
+- OTG attacks explicitly include `Downed` in their `targetRequirement` — they hit on the
+  ground but whiff against standing/airborne targets
+- Blocking, parrying, and dodging are unavailable during DOWN and DOWN_RECOVERY
+- Stagger bar does not decay during DOWN (enemy is already maximally vulnerable)
+
+#### Per-Entity Tuning
+
+DOWN duration and tech window are configurable per-entity, not per-attack:
+
+```csharp
+// On PlayerDataSO / EnemyDataSO:
+float downDuration          // total time on the floor before forced DOWN_RECOVERY begins
+float techWindowStart       // earliest frame a tech input is accepted (prevents mashing out instantly)
+float techWindowEnd         // last frame a tech is accepted (= downDuration; missed = full recovery)
+float downRecoveryDuration  // get-up animation length (tech = shortened version)
+```
+
+The attack's `knockbackVector` determines slide distance and direction while downed —
+a sweep sends the target sliding backward, a launcher with Down result goes straight down.
+
+#### Distinction from STAGGERED
+
+| | STAGGERED | DOWN |
+|---|---|---|
+| Source | Stagger bar fills | Attack `onHitTargetState = Down` |
+| Posture | Upright reel animation | Floor tumble/slide |
+| Interrupt | Hitboxes deactivate immediately | Invulnerable to non-OTG hits |
+| Exit | Timer (staggeredDuration) | Timer or player tech input |
+| Can be hit | Yes — bonus damage window | Only by OTG-flagged attacks |
 
 ---
 
