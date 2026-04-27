@@ -29,6 +29,7 @@ Assets/
 │   │   ├── Stats/          StatSheet, StatRegistry
 │   │   ├── Abilities/      AbilityBase, AbilityExecutionContext, AbilityModifierSO, EquipmentManager
 │   │   ├── MovementAbilities/ DoubleJumpAbility, AirDashAbility, GrappleAbility
+│   │   ├── Cosmetics/      CharacterCustomizationController, CosmeticRegistry
 │   │   ├── Enemies/        EnemyAIBase, EnemyStateMachine, Bosses/, Variants/
 │   │   ├── World/          RoomManager, RoomTransition, WorldStateManager, AbilityGate, GrapplePoint
 │   │   ├── Cinematics/     CinematicDirector, LetterboxController
@@ -42,6 +43,7 @@ Assets/
 │   │       ├── AbilityModifiers/
 │   │       ├── MotionInputs/       MotionPatternSO assets, StickInputConfigSO
 │   │       ├── Auras/
+│   │       ├── Cosmetics/      CosmeticSlotSO assets, CosmeticOptionSO assets, CosmeticRegistry
 │   │       ├── Enemies/
 │   │       ├── Combos/
 │   │       ├── Rooms/
@@ -758,6 +760,7 @@ public abstract void Modify(AbilityExecutionContext ctx);
 | `ShiftStatWeightModifierSO` | adjusts chi/strength/weapon weights (e.g. make flying kick chi-scaled) |
 | `ExtendHitstunModifierSO` | `ctx.hitstunDuration += seconds` |
 | `ApplySelfAuraOnHitModifierSO` | `ctx.selfAuraOnHit = aura` |
+| `ChargeCountModifierSO` | contributes `bonusCharges` to `EquipmentManager.GetChargeBonus(abilityId)` — affects charge-based abilities (double jump, air dash) at reset time, not execution time |
 
 New modifier behaviors never require touching ability code — create a new subclass and assign
 it to an item asset.
@@ -771,11 +774,18 @@ and handles equip/unequip lifecycle:
 // Registry: abilityId → modifiers contributed by currently equipped items
 Dictionary<string, List<AbilityModifierSO>> modifiersByAbilityId
 
-void RegisterModifiers(EquipmentSO item)          // called on equip
-void UnregisterModifiers(EquipmentSO item)         // called on unequip
+// Charge bonus registry: abilityId → total bonus charges from all equipped items
+// Updated incrementally on equip/unequip — not recomputed each frame
+Dictionary<string, int> chargeBonuses
+
+void RegisterModifiers(EquipmentSO item)          // called on equip; also adds ChargeCountModifierSO contributions to chargeBonuses
+void UnregisterModifiers(EquipmentSO item)         // called on unequip; subtracts contributions
 
 // Called by ability at execution time
 AbilityExecutionContext BuildContext(string abilityId, AbilityExecutionContext defaults)
+
+// Called by charge-based abilities when restoring charges (e.g. on landing)
+int GetChargeBonus(string abilityId)              // returns 0 if no contributions registered
 ```
 
 `BuildContext` clones `defaults`, iterates registered modifiers for `abilityId` in order,
@@ -829,21 +839,22 @@ bool    IsAirborne()                            // convenience inverse
 #### Double Jump (`DoubleJumpAbility`)
 
 ```csharp
-int   maxExtraJumps       // default 1; an upgrade could raise this
-int   remainingJumps      // reset to maxExtraJumps via OnPlayerLanded EventBus event
+int   maxExtraJumps       // base value, default 1
+int   remainingJumps      // runtime counter; restored on landing
 float jumpImpulseForce
 ```
 
 - Listens to `OnJump` from `InputReader`
 - Only acts when `IsAirborne()` and `remainingJumps > 0`
 - Calls `playerController.ApplyImpulse(Vector2.up * jumpImpulseForce)`
-- Decrements `remainingJumps`; resets on `OnPlayerLanded`
+- Decrements `remainingJumps`; on `OnPlayerLanded`:
+  `remainingJumps = maxExtraJumps + EquipmentManager.GetChargeBonus("DOUBLE_JUMP")`
 
 #### Air Dash (`AirDashAbility`)
 
 ```csharp
-int     maxAirDashes        // default 1
-int     remainingAirDashes  // reset on landing
+int     maxAirDashes        // base value, default 1
+int     remainingAirDashes  // runtime counter; restored on landing
 DodgeSO airDashData         // reuses existing DodgeSO — same i-frames, speed curve, recovery
 ```
 
@@ -851,7 +862,8 @@ DodgeSO airDashData         // reuses existing DodgeSO — same i-frames, speed 
 - Only acts when `IsAirborne()` and `remainingAirDashes > 0`
 - Delegates entirely to `DodgeSystem` using `airDashData`
 - Same i-frame and perfect dodge logic applies unchanged
-- Charges reset via `OnPlayerLanded`
+- On `OnPlayerLanded`:
+  `remainingAirDashes = maxAirDashes + EquipmentManager.GetChargeBonus("AIR_DASH")`
 
 #### Grapple / Hookshot (`GrappleAbility` — `WIRE_FU`)
 
@@ -1343,6 +1355,145 @@ system transparently.
 
 ---
 
+## 13. Character Customization
+
+Cosmetic-only sprite layer swapping. All options are pre-drawn assets; there is no procedural
+generation. The system supports any number of slots and options per slot — initial scope is two
+options per slot to prove the pipeline works.
+
+### Technical Backbone: Unity Sprite Library
+
+`com.unity.2d.animation` (already in the package list) ships a Sprite Library system designed
+for exactly this:
+
+- **`SpriteLibraryAsset`** — ScriptableObject that organizes sprites by **Category** (slot
+  name, e.g. "Hair") and **Label** (option name, e.g. "Topknot"). One asset for the whole
+  player character.
+- **`SpriteLibrary`** component on the player root — holds the active `SpriteLibraryAsset`.
+- **`SpriteResolver`** component on each layer child GameObject — references a Category and
+  resolves to one Label at runtime. Swapping is one call:
+  `spriteResolver.SetCategoryAndLabel("Hair", "Topknot")`
+
+The animation rig drives all layers equally. Swapping a sprite label doesn't touch the
+skeleton, blend trees, or any animation clip — it is purely a texture swap at the data level.
+
+### Defined Slots (initial)
+
+| Slot ID | Category (Sprite Library) | Initial options |
+|---|---|---|
+| `hair` | "Hair" | Topknot, Ponytail |
+| `face` | "Face" | Default, Marked (face paint / scar) |
+| `outfit` | "Outfit" | Robe, Wrapped (fighter wraps) |
+
+New slots are added by authoring new Category entries in the `SpriteLibraryAsset` and a
+corresponding `CosmeticSlotSO`. No code changes required.
+
+### Data Layer
+
+#### CosmeticSlotSO
+
+Represents one swappable slot. Registered in `CosmeticRegistry`:
+
+```csharp
+string   slotId             // matches Sprite Library Category name exactly (e.g. "Hair")
+string   displayName        // shown in customization UI
+Sprite   slotIcon           // UI icon for this slot
+List<CosmeticOptionSO> options
+```
+
+#### CosmeticOptionSO
+
+One selectable option within a slot:
+
+```csharp
+string optionId             // matches Sprite Library Label name exactly (e.g. "Topknot")
+string displayName
+Sprite previewThumbnail     // shown in the option carousel
+bool   isUnlockedByDefault  // false = must be unlocked via WorldStateManager
+```
+
+#### CosmeticRegistry
+
+ScriptableObject (one asset, assigned in GameManager):
+
+```csharp
+List<CosmeticSlotSO> slots  // ordered — defines UI display order
+```
+
+Single source of truth for all available slots and options. Adding a new slot is adding an
+entry here and drawing the sprites — nothing else.
+
+#### PlayerAppearanceData
+
+Plain serializable C# struct stored inside the save data (`WorldStateManager`):
+
+```csharp
+Dictionary<string, string> selections   // slotId → optionId
+// e.g. { "hair": "Ponytail", "face": "Default", "outfit": "Robe" }
+```
+
+Missing entries fall back to the first option in the slot's list — new slots added in
+patches won't break existing saves.
+
+### CharacterCustomizationController
+
+MonoBehaviour on the player prefab root. Holds a reference to one `SpriteResolver` per slot:
+
+```csharp
+// Inspector-assigned — one SpriteResolver child per slot, keyed by slotId
+Dictionary<string, SpriteResolver> resolvers
+
+void ApplyAppearance(PlayerAppearanceData data)
+    // for each slot: resolvers[slotId].SetCategoryAndLabel(slotId, data.selections[slotId])
+
+void ApplySlot(string slotId, string optionId)
+    // single-slot live update — called by CustomizationUI during preview
+```
+
+Listens to `OnAppearanceChanged` via EventBus to reapply after a scene load (the player
+prefab is always in the persistent Core scene, so in practice this fires once on boot).
+
+### Unlock Integration
+
+`CosmeticOptionSO.isUnlockedByDefault = false` options are locked until
+`WorldStateManager.UnlockCosmetic(slotId, optionId)` is called. The customization UI
+queries `WorldStateManager.IsCosmeticUnlocked(slotId, optionId)` per option and greys out
+locked entries with a lock icon. Unlocks can be wired to boss kills, collectibles, or any
+other `WorldState` flag — the customization system has no opinion on unlock conditions.
+
+### Customization UI (CustomizationScreen)
+
+Accessible from the pause menu or a hub NPC. Not available mid-combat.
+
+```
+┌─ Slot tabs: [Hair] [Face] [Outfit] ... ─────────────────────────────────┐
+│                                                                         │
+│   Live preview (player idle animation plays with current selections)   │
+│                                                                         │
+│   Option carousel: ← [Topknot ✓] [Ponytail] [🔒 ???] →               │
+│                                                                         │
+│                          [Confirm]  [Cancel]                            │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+- Selecting an option calls `ApplySlot()` immediately for live preview; selection is not
+  saved until Confirm
+- Cancel reverts to `WorldStateManager`-stored selections by calling `ApplyAppearance()`
+- Locked options show a lock icon and are not selectable; their `displayName` can be replaced
+  with a hint ("Defeat the Tiger Sensei")
+
+### Art Pipeline Constraint
+
+All options within a slot **must be drawn on the same canvas with identical pivot points**.
+If a hair option is drawn 3px higher than the default, it will float off the head at runtime.
+This is a sprite authoring rule, not a code safeguard — establish it as a template layer in
+the art file before drawing any options.
+
+Recommended: keep a master reference layer (body silhouette) in every art file and lock it
+while drawing cosmetics, so alignment is always relative to the same anchor.
+
+---
+
 ## 12. Build Order (Critical Path)
 
 | Order | File | Why first |
@@ -1359,4 +1510,5 @@ system transparently.
 | 10 | `PlayerController` hooks (`ApplyImpulse`, `ForceLocomotionState`, etc.) | Required before any movement ability component |
 | 11 | `MotionInputBuffer.cs` + `MotionInputDetector.cs` | Required before any motion input ability |
 | 12 | `WorldStateManager.cs` | Room persistence and ability unlocks |
-| 13 | `CinematicDirector.cs` | Required before any boss content |
+| 13 | `CharacterCustomizationController.cs` | Requires WorldStateManager for unlock queries and save/load |
+| 14 | `CinematicDirector.cs` | Required before any boss content |
