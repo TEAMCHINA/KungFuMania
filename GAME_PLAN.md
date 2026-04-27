@@ -1512,3 +1512,23 @@ while drawing cosmetics, so alignment is always relative to the same anchor.
 | 12 | `WorldStateManager.cs` | Room persistence and ability unlocks |
 | 13 | `CharacterCustomizationController.cs` | Requires WorldStateManager for unlock queries and save/load |
 | 14 | `CinematicDirector.cs` | Required before any boss content |
+
+---
+
+## TODO — Systems Not Yet Planned
+
+These systems need full design sections before any code is written. Listed in priority order —
+earlier entries block more downstream work.
+
+| Priority | System | Why it's missing / what's needed |
+|---|---|---|
+| 1 | **Hitbox / Hurtbox runtime pipeline** | `HitboxDataSO` is fully designed but the runtime mechanics are never described: how hitboxes are authored on prefabs (child colliders?), how `HitboxController.OnTriggerEnter2D` routes to `DamageCalculator`, and critically — multi-hit prevention (same hitbox must not register twice on the same target per swing). Blocks all combat implementation. |
+| 2 | **Physics layer matrix** | Which Unity physics layers exist and which collide with which (player hitbox → enemy hurtbox, environment, projectiles, etc.). Short section but must be decided before any collider is placed. Blocks the hitbox pipeline. |
+| 3 | **Enemy AI** | State machine *states* are defined but no behavior logic exists: detection (vision cone? radius? LOS?), attack decision-making beyond "weighted random," aggression/spacing model, ranged vs. melee differences, boss AI phase navigation. Blocks any enemy implementation. |
+| 4 | **`EquipmentSO` definition** | `EquipmentManager`, `AbilityModifierSO`, and the loot system all reference `EquipmentSO` but its fields are never defined. Needs: equipment slot types (weapon, armor, accessory), stat contribution fields, modifier list, display data. Blocks all equipment/loot work. |
+| 5 | **Death & respawn flow** | Completely absent. What happens when HP reaches 0: death animation, which respawn point is selected, what state is restored (health, position, auras, enemy state), whether there is a death penalty. Needed before the health system or player controller can be considered complete. |
+| 6 | **Save system detail** | `WorldStateManager` mentions JSON serialization but the flow is vague: what triggers a save (room transition? checkpoint activation? manual?), checkpoint placement rules, save slot management, and how death-respawn integrates with the save state. Closely related to #5 but a separate design concern. |
+| 7 | **Loot & item drops** | Drop tables (enemy-specific? room-specific? global pool?), item pickup interaction, and a minimal inventory/equipment slot UI. The `AbilityModifierSO` pipeline is ready to consume items — nothing yet produces them. |
+| 8 | **Level up / XP system** | `LevelScale` exists in the damage formula and stats reference `level`, but there is no XP gain, level-up event, stat growth on level-up, or player-facing progression loop. |
+| 9 | **Camera system** | Cinemachine is planned for combat effects (impulse shake, bullet time zoom, boss cinematics) but the *gameplay* camera is never designed: room-based confinement, player follow behavior (lookahead? deadzone?), camera transition between rooms, and lock-on framing during boss fights. |
+| 10 | **NPC / dialogue** | Most metroidvanias require at least a minimal system: dialogue trigger volumes, a text display component, branching or sequential lines, and integration with `WorldStateManager` for state-gated dialogue. Needed for lore delivery, merchants, and ability teachers. Lowest priority — doesn't block combat or movement. |
