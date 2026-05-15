@@ -295,9 +295,6 @@ if (!attack.targetRequirement.Satisfies(target.currentLocomotionState))
   → whiff; hitbox overlap is silently ignored; no damage, no stagger, no state change
   // e.g. command throw whiffs vs. airborne; low sweep whiffs vs. jumping; OTG whiffs vs. standing
 
-if (isUnblockable && BLOCKING)
-  → full damage + guard break animation
-
 else if (PERFECT_PARRY && hasPerfectParryCounter)
   → 0 damage to player
   → trigger PERFECT_PARRY_COUNTER state (plays perfectParryCounterAnimation)
@@ -311,10 +308,16 @@ else if (PERFECT_PARRY)
 else if (PARRY_ACTIVE)
   → 0 damage, enemy staggered, parryStaggerDamage
 
-else if (BLOCKING)
+// Block is determined by physical Hurtbox_Block contact + ray validation (see 3n).
+// BLOCKING locomotion state alone does not reduce damage — the shield must be hit.
+// blockResult is Pending, Blocked, or Unblocked; Pending treated as Unblocked at resolution time.
+else if (blockResult == Blocked && isUnblockable)
+  → full damage + guard break animation
+
+else if (blockResult == Blocked)
   → RawDamage = damage * blockDamagePercent
 
-else
+else  // Pending or Unblocked
   → RawDamage = full damage, staggerDamage
 
 // Armor applied last, after all parry/block resolution, for both player and enemy targets:
@@ -1086,6 +1089,226 @@ a sweep sends the target sliding backward, a launcher with Down result goes stra
 
 ---
 
+### 3n. Hitbox / Hurtbox Runtime Pipeline
+
+#### Authoring
+
+Each actor carries **two hitbox child GameObjects** (primary and secondary) and **one body hurtbox**
+with optional child hurtboxes for specific zones:
+
+```
+Actor (root)
+├── Hitbox_Primary     — BoxCollider2D (trigger), starts disabled, Physics layer: [Actor]Hitbox
+├── Hitbox_Secondary   — BoxCollider2D (trigger), starts disabled, Physics layer: [Actor]Hitbox
+├── Hurtbox_Body       — BoxCollider2D (trigger), always active,   Physics layer: [Actor]Hurtbox  ← primary body collider
+│   ├── Hurtbox_Head   — BoxCollider2D (trigger), optional child,  Physics layer: [Actor]HurtboxZone
+│   └── Hurtbox_Block  — BoxCollider2D (trigger), optional child,  Physics layer: [Actor]HurtboxZone
+└── HitboxEventRelay   — MonoBehaviour, receives animation events, routes to HitboxController
+```
+
+Most attacks use only `Hitbox_Primary`. `Hitbox_Secondary` is available for attacks with an unusual
+shape or reach (e.g. a wide sweep while the primary covers the forward strike zone).
+
+**`Hurtbox_Head`** — covers the head region. Always active. Attacks that care about headshots opt
+in via `HitboxDataSO` modifiers; attacks that don't care ignore the zone entirely with no extra logic.
+
+**`Hurtbox_Block`** — the physical shield or guard zone. **Only enabled during BLOCKING/GUARD state.**
+When enabled, `Hurtbox_Body` simultaneously **expands** to physically encompass the block child
+collider — guaranteeing that any contact with the shield also contacts the parent body in the same
+physics step. This is the mechanism that makes the parent the sole trigger for resolution (see below).
+Only `canBlock = true` actors carry this child; non-blocking enemies are never subject to block reduction.
+
+#### Hurtbox Pose Matching
+
+`Hurtbox_Body` is **not a static collider**. It must represent the character's actual hittable
+silhouette at each moment during an attack or ability — not a fixed standing-idle approximation
+baked onto the prefab.
+
+Two failure modes this prevents:
+- **Ghost hit**: the default hurtbox covers space the character has vacated (e.g. a leaping kick
+  where the feet are now high in the air — the default ground-level box still registers hits at
+  shin height where the character no longer is).
+- **Phantom immunity**: the character's pose extends beyond the default hurtbox (e.g. a wide arm
+  sweep where the extended arm is exposed but the narrow standing box doesn't cover it).
+
+**Animators own the hurtbox directly.** `HurtboxController` exposes offset and size as serialized
+fields, making them keyframeable from Unity's Animation window like any other property. Animators
+shape the hurtbox in the same tool where they author the sprite — no programmer coordination, no
+preset list to maintain:
+
+```csharp
+// On HurtboxController — keyframed directly in the Animation window
+[SerializeField] public Vector2 hurtboxOffset;   // applied to Hurtbox_Body each FixedUpdate
+[SerializeField] public Vector2 hurtboxSize;
+```
+
+`HurtboxController` reads these values and applies them to the collider each `FixedUpdate`.
+Gameplay data (hurtbox shape) lives in the animation clip rather than purely in the Inspector —
+an acceptable coupling for a small team, and appropriate since animators have the most context for
+where the character is actually hittable on any given frame.
+
+**Reset convention**: every clip keyframes the default standing values on frame 0. Clips that never
+need to reshape the hurtbox do it once on frame 0 and leave it. The idle and locomotion clips
+establish the canonical default. Only clips with poses that meaningfully expose or vacate significant
+body area need additional keyframes — jabs, light kicks, and other standing-silhouette attacks
+require nothing beyond the frame 0 default.
+
+**Compound shapes**: `Hurtbox_Body` is the *primary* body collider, not the only one the
+architecture permits. Because `HurtboxController` owns resolution rather than any individual
+collider, adding a secondary body collider (e.g. a separate wide-short box for the legs during a
+split kick) is additive — a new child collider routes through the same resolution path, and
+animators keyframe a second offset/size pair on `HurtboxController` independently. No structural
+changes to the current design are needed to support this later.
+
+A facing dot product alone is too crude for block detection — an attack from a diagonal angle can
+pass the dot check even if it reached the body before the shield. Instead, when `Hurtbox_Block`
+contact fires, a ray is cast from the **attacker's active hitbox center** toward the **victim's
+body center**. If the ray intersects the block collider's boundary before reaching the body center,
+the shield was physically in the attack path.
+
+```
+attackerHitboxCenter ──────ray──────► victimBodyCenter
+                          passes through Hurtbox_Block boundary?
+                             YES → shield was in the path → Blocked
+                             NO  → attack bypassed the shield → Unblocked
+```
+
+```csharp
+Vector2      dir  = (victimRoot.position - attackerHitboxCenter).normalized;
+float        dist = Vector2.Distance(attackerHitboxCenter, victimRoot.position);
+RaycastHit2D hit  = Physics2D.Raycast(attackerHitboxCenter, dir, dist, blockZoneLayer);
+// Blocked if the ray hit the block collider specifically (not any other geometry)
+bool shieldInPath = hit.collider == blockHurtboxCollider;
+```
+
+No direction vector is needed on the attack SO — all data is derived from current positions.
+
+#### Animation → Combat Decoupling (HitboxEventRelay)
+
+Animations have no knowledge of the combat system. Each attack animation fires **Unity Animation
+Events** on a single intermediate MonoBehaviour — `HitboxEventRelay` — mounted on the actor root:
+
+```csharp
+// Called by Animation Events only — the animator knows two integer events, nothing else
+void OnHitboxActive(int hitboxIndex)    // 0 = primary, 1 = secondary
+void OnHitboxInactive(int hitboxIndex)
+```
+
+`HitboxEventRelay` forwards these calls to `HitboxController`. All combat logic lives there.
+Hurtbox shape is not driven by animation events — it is keyframed directly on `HurtboxController`
+properties from the Animation window (see Hurtbox Pose Matching above).
+
+#### HitboxController
+
+Manages the two hitbox colliders and owns the current `HitboxDataSO` reference for each active swing:
+
+```csharp
+HitboxDataSO  activeHitboxData    // set by the AttackSO before the animation plays
+void Activate(int index)           // enables collider[index]
+void Deactivate(int index)         // disables collider[index]
+// OnTriggerEnter2D — see resolution below
+```
+
+When a combat state is entered, the `AttackSO` (or `ComboStep`) pushes its `HitboxDataSO` to
+`HitboxController.activeHitboxData` before any animation events fire. The data is already in place
+when the trigger fires.
+
+#### HurtboxController
+
+```csharp
+enum BlockResult {
+    Pending,    // Hurtbox_Body fired this step; block child hasn't reported yet
+    Blocked,    // Hurtbox_Block fired AND ray check confirmed shield was in the attack path
+    Unblocked   // Hurtbox_Block didn't fire this step, or ray check failed
+}
+
+BlockResult blockResult    // reset to Pending when Hurtbox_Body fires; promoted by Hurtbox_Block
+bool        isHeadHit      // set true when Hurtbox_Head fires; cleared after resolution
+```
+
+`Hurtbox_Body.OnTriggerEnter2D` — **the sole trigger for damage resolution**. Sets
+`blockResult = Pending` and records the contact for `LateFixedUpdate`.
+
+`Hurtbox_Head.OnTriggerEnter2D` — sets `isHeadHit = true` only. Never triggers resolution.
+
+`Hurtbox_Block.OnTriggerEnter2D` — runs the ray check and promotes `blockResult` to
+`Blocked` or `Unblocked`. Never triggers resolution. Because `Hurtbox_Body` is expanded to
+encompass the block child during BLOCKING, the body contact always arrives in the same
+physics step — `LateFixedUpdate` reads a fully-resolved `blockResult` every time.
+
+#### Damage Resolution
+
+```
+HitboxController.LateFixedUpdate — runs when Hurtbox_Body contact was recorded this step:
+  1. Build damage context from activeHitboxData + attacker StatSheet
+
+  2. Block resolution (blockResult set by Hurtbox_Block in same step, or Pending if not hit):
+       Pending or Unblocked:
+         → full damage, full stagger
+       Blocked, isUnblockable = false:
+         → RawDamage = full * blockDamagePercent, reduced stagger
+       Blocked, isUnblockable = true:
+         → full damage + guard break animation
+
+  3. Head modifiers (isHeadHit — fully opt-in per attack):
+       if isHeadHit AND attack has non-default head modifiers:
+         ctx.baseMultiplier     *= headHitDamageMultiplier
+         ctx.staggerDamage      *= headHitStaggerMultiplier
+         ctx.onHitAuras.AddRange(headHitAuras)    // e.g. StunAuraSO
+       (default values 1.0 / 1.0 / empty — head zone contact has zero effect)
+
+  4. DamageCalculator.Resolve(ctx, attackerStats, target.GetComponent<StatSheet>())
+       → applies final damage to target health
+       → applies stagger to target StaggerMeter
+       → publishes OnEntityDamaged / OnEntityDowned / etc. via EventBus
+         (UI, audio, and hurt-state transitions subscribe independently)
+
+  5. Reset blockResult and isHeadHit; clear pending contact flag
+```
+
+`DamageCalculator` applies damage directly and publishes results via EventBus. No response object
+is returned — EventBus subscribers handle state reactions without coupling to the calculator.
+
+#### Single-Hit Guarantee and the Flowing Attack Case
+
+Each hitbox **activation cycle** (Activate → triggers fire → Deactivate) produces at most one
+`DamageCalculator.Resolve` call per target. Resolution is triggered only by `Hurtbox_Body`
+firing `OnTriggerEnter2D` — which fires **once per entry**, not per frame.
+
+**Flowing attack case** (e.g. a jump kick that enters the head zone and later drifts into the
+shield zone during the same activation):
+
+```
+Frame N:   Hurtbox_Body.OnTriggerEnter2D fires (hitbox at head level, above shield)
+             blockResult = Pending; isHeadHit = true
+           Hurtbox_Block not entered (hitbox hasn't reached shield yet)
+           LateFixedUpdate: Pending → Unblocked → full damage applied; flags reset
+
+Frame N+M: Hurtbox_Block.OnTriggerEnter2D fires (animation has flowed into shield area)
+             → runs ray check, sets blockResult = Blocked or Unblocked
+             BUT: Hurtbox_Body was NOT re-entered — hitbox was already inside it from frame N
+             → OnTriggerEnter2D does not re-fire; LateFixedUpdate has no body contact → nothing resolves
+```
+
+The shield contact on frame N+M is inert. The hit resolved as unblocked on frame N.
+Multi-hit attacks use multiple activation cycles (Deactivate then re-Activate between hits),
+which re-enables Enter detection for the next target contact cleanly.
+
+#### Head Hit Modifiers on HitboxDataSO
+
+```csharp
+// Head hit — defaults = body hit unchanged; set non-defaults to opt in
+float        headHitDamageMultiplier    // default 1.0
+float        headHitStaggerMultiplier   // default 1.0
+List<AuraSO> headHitAuras              // e.g. StunAuraSO; default empty
+```
+
+Block resolution requires no per-attack configuration beyond `blockDamagePercent` and
+`isUnblockable`, which are already on `HitboxDataSO`. Every attack interacts with the block
+zone correctly automatically — the attack data has no knowledge of whether the target has a shield.
+
+---
+
 ## 4. Metroidvania Map / Scene Management
 
 ### Scene Structure
@@ -1522,13 +1745,12 @@ earlier entries block more downstream work.
 
 | Priority | System | Why it's missing / what's needed |
 |---|---|---|
-| 1 | **Hitbox / Hurtbox runtime pipeline** | `HitboxDataSO` is fully designed but the runtime mechanics are never described: how hitboxes are authored on prefabs (child colliders?), how `HitboxController.OnTriggerEnter2D` routes to `DamageCalculator`, and critically — multi-hit prevention (same hitbox must not register twice on the same target per swing). Blocks all combat implementation. |
-| 2 | **Physics layer matrix** | Which Unity physics layers exist and which collide with which (player hitbox → enemy hurtbox, environment, projectiles, etc.). Short section but must be decided before any collider is placed. Blocks the hitbox pipeline. |
-| 3 | **Enemy AI** | State machine *states* are defined but no behavior logic exists: detection (vision cone? radius? LOS?), attack decision-making beyond "weighted random," aggression/spacing model, ranged vs. melee differences, boss AI phase navigation. Blocks any enemy implementation. |
-| 4 | **`EquipmentSO` definition** | `EquipmentManager`, `AbilityModifierSO`, and the loot system all reference `EquipmentSO` but its fields are never defined. Needs: equipment slot types (weapon, armor, accessory), stat contribution fields, modifier list, display data. Blocks all equipment/loot work. |
-| 5 | **Death & respawn flow** | Completely absent. What happens when HP reaches 0: death animation, which respawn point is selected, what state is restored (health, position, auras, enemy state), whether there is a death penalty. Needed before the health system or player controller can be considered complete. |
-| 6 | **Save system detail** | `WorldStateManager` mentions JSON serialization but the flow is vague: what triggers a save (room transition? checkpoint activation? manual?), checkpoint placement rules, save slot management, and how death-respawn integrates with the save state. Closely related to #5 but a separate design concern. |
-| 7 | **Loot & item drops** | Drop tables (enemy-specific? room-specific? global pool?), item pickup interaction, and a minimal inventory/equipment slot UI. The `AbilityModifierSO` pipeline is ready to consume items — nothing yet produces them. |
-| 8 | **Level up / XP system** | `LevelScale` exists in the damage formula and stats reference `level`, but there is no XP gain, level-up event, stat growth on level-up, or player-facing progression loop. |
-| 9 | **Camera system** | Cinemachine is planned for combat effects (impulse shake, bullet time zoom, boss cinematics) but the *gameplay* camera is never designed: room-based confinement, player follow behavior (lookahead? deadzone?), camera transition between rooms, and lock-on framing during boss fights. |
-| 10 | **NPC / dialogue** | Most metroidvanias require at least a minimal system: dialogue trigger volumes, a text display component, branching or sequential lines, and integration with `WorldStateManager` for state-gated dialogue. Needed for lore delivery, merchants, and ability teachers. Lowest priority — doesn't block combat or movement. |
+| 1 | **Physics layer matrix** | Which Unity physics layers exist and which collide with which (player hitbox → enemy hurtbox, environment, projectiles, etc.). Short section but must be decided before any collider is placed. Blocks the hitbox pipeline. |
+| 2 | **Enemy AI** | State machine *states* are defined but no behavior logic exists: detection (vision cone? radius? LOS?), attack decision-making beyond "weighted random," aggression/spacing model, ranged vs. melee differences, boss AI phase navigation. Blocks any enemy implementation. |
+| 3 | **`EquipmentSO` definition** | `EquipmentManager`, `AbilityModifierSO`, and the loot system all reference `EquipmentSO` but its fields are never defined. Needs: equipment slot types (weapon, armor, accessory), stat contribution fields, modifier list, display data. Blocks all equipment/loot work. |
+| 4 | **Death & respawn flow** | Completely absent. What happens when HP reaches 0: death animation, which respawn point is selected, what state is restored (health, position, auras, enemy state), whether there is a death penalty. Needed before the health system or player controller can be considered complete. |
+| 5 | **Save system detail** | `WorldStateManager` mentions JSON serialization but the flow is vague: what triggers a save (room transition? checkpoint activation? manual?), checkpoint placement rules, save slot management, and how death-respawn integrates with the save state. Closely related to #4 but a separate design concern. |
+| 6 | **Loot & item drops** | Drop tables (enemy-specific? room-specific? global pool?), item pickup interaction, and a minimal inventory/equipment slot UI. The `AbilityModifierSO` pipeline is ready to consume items — nothing yet produces them. |
+| 7 | **Level up / XP system** | `LevelScale` exists in the damage formula and stats reference `level`, but there is no XP gain, level-up event, stat growth on level-up, or player-facing progression loop. |
+| 8 | **Camera system** | Cinemachine is planned for combat effects (impulse shake, bullet time zoom, boss cinematics) but the *gameplay* camera is never designed: room-based confinement, player follow behavior (lookahead? deadzone?), camera transition between rooms, and lock-on framing during boss fights. |
+| 9 | **NPC / dialogue** | Most metroidvanias require at least a minimal system: dialogue trigger volumes, a text display component, branching or sequential lines, and integration with `WorldStateManager` for state-gated dialogue. Needed for lore delivery, merchants, and ability teachers. Lowest priority — doesn't block combat or movement. |
