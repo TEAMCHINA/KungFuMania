@@ -212,6 +212,17 @@ bool          perfectParryCounterBulletTime   // default false — triggers slow
 float         perfectParryCounterTimeScale    // e.g. 0.2 (only used if bulletTime = true)
 float         perfectParryCounterZoomAmount   // Cinemachine FOV delta (only used if bulletTime = true)
 
+// Parry attacker auras — applied to the ATTACKER when this attack is successfully parried
+// Both default to empty; most attacks leave these unset
+List<AuraSO>  onParryAttackerAuras            // applied on standard parry (e.g. brief stagger aura)
+List<AuraSO>  onPerfectParryAttackerAuras     // applied on perfect parry (typically a superset)
+
+// Parry defender auras — applied to the DEFENDER (parryer) when this attack is successfully parried
+// Both default to empty; most attacks leave these unset
+// Universal parry rewards (e.g. 3s damage boost on any parry) live on ParrySettingsSO instead
+List<AuraSO>  onParryDefenderAuras            // applied on standard parry
+List<AuraSO>  onPerfectParryDefenderAuras     // applied on perfect parry
+
 // Target state precondition — checked before damage resolution; whiffs if not satisfied
 TargetStateRequirement targetRequirement  // default None — no restriction
                                           // see enum below; use flags for multi-state attacks
@@ -284,57 +295,106 @@ their own state durations as natural recovery; this system applies to **missed a
 
 `ParrySettingsSO`:
 ```csharp
-float parryRecoveryDuration    // e.g. 0.4s — hold >= this = no lockout
+float  parryRecoveryDuration    // e.g. 0.4s — hold >= this = no lockout
+
+// Universal defender rewards — applied on ANY successful parry of that tier
+// null = no global reward; per-attack HitboxDataSO defender auras stack on top of these
+AuraSO onStandardParryDefenderAura     // e.g. 3s damage boost aura
+AuraSO onPerfectParryDefenderAura      // e.g. perfect-parry follow-up window aura
 ```
+
+`ParrySystem` (or a lightweight component on the player) subscribes to `OnParry` /
+`OnPerfectParry` / `OnPerfectParryCounter` EventBus events and calls
+`playerAuraManager.ApplyAura(parrySettings.onXxxDefenderAura)` if non-null.
+`DamageCalculator` never reads `ParrySettingsSO` — the EventBus keeps them decoupled.
 
 #### DamageCalculator Resolution Order
 
+`HurtboxController` reads `combatProvider.CurrentCombatState` (via `ICombatStateProvider` on the
+actor root) and passes it into `DamageCalculator.Resolve` at resolution time. `PlayerStateMachine`
+and `EnemyStateMachine` implement `ICombatStateProvider`.
+
+```csharp
+DamageCalculator.Resolve(
+    AbilityExecutionContext ctx,          // damage weights, onHitAuras, selfAuraOnHit
+    StatSheet               attackerStats,
+    AuraManager             attackerAuras,  // for selfAuraOnHit + parry attacker debuffs
+    StatSheet               targetStats,
+    AuraManager             targetAuras,    // for onHitAuras
+    CombatLayerState        targetCombatState
+)
 ```
-// Precondition check — runs before any damage or state resolution:
-if (!attack.targetRequirement.Satisfies(target.currentLocomotionState))
-  → whiff; hitbox overlap is silently ignored; no damage, no stagger, no state change
-  // e.g. command throw whiffs vs. airborne; low sweep whiffs vs. jumping; OTG whiffs vs. standing
 
-else if (PERFECT_PARRY && hasPerfectParryCounter)
-  → 0 damage to player
-  → trigger PERFECT_PARRY_COUNTER state (plays perfectParryCounterAnimation)
-  → if perfectParryCounterBulletTime: drop timeScale, zoom camera, restore on counter end
-  → deal perfectParryCounterDamage to attacker (attacker is in ATTACK_RECOVERY, cannot block)
-  → apply parryStaggerDamage * perfectParryStaggerMultiplier to stagger bar
+```
+// 1. Precondition — whiff check
+if (!attack.targetRequirement.Satisfies(targetLocomotionState))
+    → silent whiff; return
+    // e.g. command throw whiffs vs. airborne; low sweep whiffs vs. jumping; OTG whiffs vs. standing
 
-else if (PERFECT_PARRY)
-  → 0 damage, counter window opens, parryStaggerDamage * perfectParryStaggerMultiplier
+// 2. Parry resolution — checked before block or damage
+if (targetCombatState == PERFECT_PARRY && hasPerfectParryCounter)
+    → 0 damage to target
+    → apply parryStaggerDamage * perfectParryStaggerMultiplier to attacker StaggerMeter
+    → attackerAuras.ApplyAll(onPerfectParryAttackerAuras)
+    → targetAuras.ApplyAll(onPerfectParryDefenderAuras)
+    → deal perfectParryCounterDamage to attacker health (raw, no armor, no block)
+    → EventBus.Publish(OnPerfectParryCounter { attacker, defender, hitboxData })
+      (subscribers: combat layer → PERFECT_PARRY_COUNTER state, CinematicDirector → bullet
+       time if perfectParryCounterBulletTime, AudioManager → parry clang SFX)
+    → return
 
-else if (PARRY_ACTIVE)
-  → 0 damage, enemy staggered, parryStaggerDamage
+if (targetCombatState == PERFECT_PARRY)
+    → 0 damage to target
+    → apply parryStaggerDamage * perfectParryStaggerMultiplier to attacker StaggerMeter
+    → attackerAuras.ApplyAll(onPerfectParryAttackerAuras)
+    → targetAuras.ApplyAll(onPerfectParryDefenderAuras)
+    → EventBus.Publish(OnPerfectParry { attacker, defender })
+      (subscribers: combat layer → counter window opens)
+    → return
 
+if (targetCombatState == PARRY_ACTIVE)
+    → 0 damage to target
+    → apply parryStaggerDamage to attacker StaggerMeter
+    → attackerAuras.ApplyAll(onParryAttackerAuras)
+    → targetAuras.ApplyAll(onParryDefenderAuras)
+    → EventBus.Publish(OnParry { attacker, defender })
+    → return
+
+// 3. Block resolution
 // Block is determined by physical Hurtbox_Block contact + ray validation (see 3n).
 // BLOCKING locomotion state alone does not reduce damage — the shield must be hit.
 // blockResult is Pending, Blocked, or Unblocked; Pending treated as Unblocked at resolution time.
-else if (blockResult == Blocked && isUnblockable)
-  → full damage + guard break animation
+if (blockResult == Blocked && isUnblockable)
+    → full damage + EventBus.Publish(OnGuardBreak { target })
+elif (blockResult == Blocked)
+    → RawDamage = full * blockDamagePercent
+else
+    → RawDamage = full
 
-else if (blockResult == Blocked)
-  → RawDamage = damage * blockDamagePercent
-
-else  // Pending or Unblocked
-  → RawDamage = full damage, staggerDamage
-
-// Armor applied last, after all parry/block resolution, for both player and enemy targets:
-EffectiveArmor = targetStats.Armor * (1 - attack.armorPenetration)
+// 4. Armor — applied after all parry/block resolution, for both player and enemy targets
+EffectiveArmor = targetStats.Armor * (1 - ctx.armorPenetration)
 FinalDamage    = max(1, RawDamage - EffectiveArmor)
 // max(1) ensures at least 1 damage always lands — attacks never feel completely negated
 
-// Interrupt resolution — runs after damage and stagger are applied:
+// 5. Apply damage + stagger (non-parry path only)
+target health -= FinalDamage
+target StaggerMeter += ctx.staggerDamage   // 0 for blocked hits if reduced stagger applies
+
+// 6. Super armor / hurt state interrupt (non-parry path only)
 if (staggerBarJustFilled)
-  → STAGGERED — overrides super armor; deactivate all hitboxes immediately (no trade)
-else if (target.currentAttack.superArmor)
-  → animation continues; hurt state suppressed; damage and stagger already applied above
-else
-  → target enters attack.onHitTargetState:
-      Hurt     → HURT (standard hitstun)
-      Down     → DOWN (knockdown floor animation, then DOWN_RECOVERY)
-      Launched → FALL with upward knockback vector (juggle)
+    → STAGGERED — overrides super armor; deactivate all hitboxes immediately (no trade)
+elif (!superArmor)
+    → target enters onHitTargetState:
+          Hurt     → HURT (standard hitstun)
+          Down     → DOWN (knockdown floor animation, then DOWN_RECOVERY)
+          Launched → FALL with upward knockback vector (juggle)
+
+// 7. On-hit auras (non-parry path only)
+targetAuras.ApplyAll(ctx.onHitAuras)
+if (ctx.selfAuraOnHit != null) attackerAuras.Apply(ctx.selfAuraOnHit)
+
+// 8. Publish
+EventBus.Publish(OnEntityDamaged { target, finalDamage, ... })
 ```
 
 ---
@@ -804,15 +864,9 @@ Player activates ability
   → EquipmentManager.BuildContext(abilityId, defaults) called
       → each registered AbilityModifierSO mutates context in order
   → ability executes using final context values
-  → DamageCalculator.Compute(ctx, casterStats, targetStats) called per hit
-      → BaseDamage     = (Strength * ctx.strengthWeight)
-                       + (Chi * ctx.chiWeight)
-                       + (WeaponDamage * ctx.weaponWeight)
-      → RawDamage      = BaseDamage * ctx.baseMultiplier * LevelScale * blockModifier
-      → EffectiveArmor = targetStats.Armor * (1 - attack.armorPenetration)
-      → FinalDamage    = max(1, RawDamage - EffectiveArmor)
-      // applies identically whether target is player or enemy
-  → onHitAuras applied to target, selfAuraOnHit applied to caster
+  → DamageCalculator.Resolve(ctx, attackerStats, attackerAuras, targetStats, targetAuras, targetCombatState) called per hit
+      → full resolution order: parry check → block check → armor → damage + stagger → hurt state → on-hit auras → EventBus.Publish
+      // (see 3b for complete resolution pseudocode)
 ```
 
 ---
@@ -1088,6 +1142,12 @@ a sweep sends the target sliding backward, a launcher with Down result goes stra
 | Exit | Timer (staggeredDuration) | Timer or player tech input |
 | Can be hit | Yes — bonus damage window | Only by OTG-flagged attacks |
 
+**HurtboxController and physics layers are unchanged during DOWN.** The body hurtbox remains
+active — contacts still route to `HurtboxController` and would reach `DamageCalculator` normally.
+The only gate is the whiff check: a non-OTG attack's `targetRequirement` does not include `Downed`,
+so `DamageCalculator.Resolve` returns early before any damage or state change. No collider
+toggling, no new physics layer, and no `HurtboxController` changes are required.
+
 ---
 
 ### 3n. Hitbox / Hurtbox Runtime Pipeline
@@ -1154,6 +1214,13 @@ need to reshape the hurtbox do it once on frame 0 and leave it. The idle and loc
 establish the canonical default. Only clips with poses that meaningfully expose or vacate significant
 body area need additional keyframes — jabs, light kicks, and other standing-silhouette attacks
 require nothing beyond the frame 0 default.
+
+**Non-upright poses (DOWN, crouch, airborne, etc.).** When an entity enters a locomotion state
+with a distinct silhouette, the relevant animation clip keyframes new `hurtboxOffset` /
+`hurtboxSize` values on `HurtboxController`. The system makes no assumptions about pose shape —
+a floor-sliding player, a boss taking a knee, an airborne kick — any posture is handled by
+animators authoring appropriate values for that clip. No pose-specific code or presets are
+needed; the clip is the source of truth.
 
 **Compound shapes**: `Hurtbox_Body` is the *primary* body collider, not the only one the
 architecture permits. Because `HurtboxController` owns resolution rather than any individual
@@ -1237,6 +1304,10 @@ void SetInvulnerable(bool active):
     // Hurtbox_Head and Hurtbox_Block cascade automatically as children of hurtboxBodyObject
     // Hurtbox_Pierce is NOT a child — it is never touched by SetInvulnerable
 ```
+
+`HurtboxController` holds an `ICombatStateProvider` reference (set on `Start` via `GetComponent` on
+the actor root) and passes `combatProvider.CurrentCombatState` into `DamageCalculator.Resolve` at
+resolution time. `PlayerStateMachine` and `EnemyStateMachine` implement `ICombatStateProvider`.
 
 Each zone child GameObject carries a lightweight `HurtboxZoneForwarder` component that
 captures `OnTriggerEnter2D` and routes it to `HurtboxController.OnZoneHit(zoneType, other)`.
