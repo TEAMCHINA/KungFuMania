@@ -1238,17 +1238,22 @@ void SetInvulnerable(bool active):
     // Hurtbox_Pierce is NOT a child — it is never touched by SetInvulnerable
 ```
 
-`Hurtbox_Body.OnTriggerEnter2D` — **the sole trigger for damage resolution**. Sets
+Each zone child GameObject carries a lightweight `HurtboxZoneForwarder` component that
+captures `OnTriggerEnter2D` and routes it to `HurtboxController.OnZoneHit(zoneType, other)`.
+This is necessary because Unity fires trigger callbacks on the Rigidbody2D owner's scripts,
+not on individual child colliders — the forwarder is the wiring, not logic.
+
+`Hurtbox_Body` contact (`zoneType = Body`) — **the sole trigger for damage resolution**. Sets
 `blockResult = Pending` and records the contact for `LateFixedUpdate`.
 
-`Hurtbox_Head.OnTriggerEnter2D` — sets `isHeadHit = true` only. Never triggers resolution.
+`Hurtbox_Head` contact (`zoneType = Head`) — sets `isHeadHit = true` only. Never triggers resolution.
 
-`Hurtbox_Block.OnTriggerEnter2D` — runs the ray check and promotes `blockResult` to
+`Hurtbox_Block` contact (`zoneType = Block`) — runs the ray check and promotes `blockResult` to
 `Blocked` or `Unblocked`. Never triggers resolution. Because `Hurtbox_Body` is expanded to
 encompass the block child during BLOCKING, the body contact always arrives in the same
 physics step — `LateFixedUpdate` reads a fully-resolved `blockResult` every time.
 
-`Hurtbox_Pierce.OnTriggerEnter2D` — routes to resolution identically to `Hurtbox_Body`.
+`Hurtbox_Pierce` contact (`zoneType = Pierce`) — routes to resolution identically to Body.
 Only reachable by hitboxes on the pierce physics layer (see Physics Layer Matrix). Exists
 solely so `piercesDodgeIFrames = true` attacks still land when the body GameObject is inactive.
 
