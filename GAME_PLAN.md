@@ -527,9 +527,10 @@ float  perfectDodgeZoomAmount          // Cinemachine FOV delta
 AuraSO perfectDodgeAura                // aura applied on perfect dodge (assigned in Inspector)
 ```
 
-- I-frames disable the player `HurtboxController` for the configured window. Attacks with
-  `piercesDodgeIFrames = true` bypass this check entirely — the player can still dodge away
-  but is not protected by i-frames.
+- I-frames call `hurtboxController.SetInvulnerable(true)` at `iFrameStartFrame` and
+  `SetInvulnerable(false)` at `iFrameEndFrame`, deactivating the body hurtbox GameObject so
+  attacks physically whiff. Attacks with `piercesDodgeIFrames = true` bypass this via a
+  separate `Hurtbox_Pierce` collider that is never deactivated (see 3n — I-Frames).
 - Position delta via direct transform + collision check (not physics) for precise frame control.
 - `DODGE_RECOVERY` window after the dodge prevents spam.
 
@@ -1103,6 +1104,7 @@ Actor (root)
 ├── Hurtbox_Body       — BoxCollider2D (trigger), always active,   Physics layer: [Actor]Hurtbox  ← primary body collider
 │   ├── Hurtbox_Head   — BoxCollider2D (trigger), optional child,  Physics layer: [Actor]HurtboxZone
 │   └── Hurtbox_Block  — BoxCollider2D (trigger), optional child,  Physics layer: [Actor]HurtboxZone
+├── Hurtbox_Pierce     — BoxCollider2D (trigger), NEVER disabled,  Physics layer: [Actor]HurtboxPierce
 └── HitboxEventRelay   — MonoBehaviour, receives animation events, routes to HitboxController
 ```
 
@@ -1189,14 +1191,16 @@ Animations have no knowledge of the combat system. Each attack animation fires *
 Events** on a single intermediate MonoBehaviour — `HitboxEventRelay` — mounted on the actor root:
 
 ```csharp
-// Called by Animation Events only — the animator knows two integer events, nothing else
+// Called by Animation Events only — the animator knows these events, nothing else
 void OnHitboxActive(int hitboxIndex)    // 0 = primary, 1 = secondary
 void OnHitboxInactive(int hitboxIndex)
+void OnInvulnerableStart()              // i-frame window begins (dodge handled by DodgeSystem directly)
+void OnInvulnerableEnd()                // i-frame window ends
 ```
 
-`HitboxEventRelay` forwards these calls to `HitboxController`. All combat logic lives there.
-Hurtbox shape is not driven by animation events — it is keyframed directly on `HurtboxController`
-properties from the Animation window (see Hurtbox Pose Matching above).
+`HitboxEventRelay` forwards hitbox calls to `HitboxController` and invulnerability calls to
+`HurtboxController`. Hurtbox shape is not driven by animation events — it is keyframed directly
+on `HurtboxController` properties from the Animation window (see Hurtbox Pose Matching above).
 
 #### HitboxController
 
@@ -1224,6 +1228,14 @@ enum BlockResult {
 
 BlockResult blockResult    // reset to Pending when Hurtbox_Body fires; promoted by Hurtbox_Block
 bool        isHeadHit      // set true when Hurtbox_Head fires; cleared after resolution
+
+// I-frame control — reference-counted so overlapping sources don't interfere
+int  invulnerabilityCount = 0
+void SetInvulnerable(bool active):
+    invulnerabilityCount += active ? 1 : -1
+    hurtboxBodyObject.SetActive(invulnerabilityCount == 0)
+    // Hurtbox_Head and Hurtbox_Block cascade automatically as children of hurtboxBodyObject
+    // Hurtbox_Pierce is NOT a child — it is never touched by SetInvulnerable
 ```
 
 `Hurtbox_Body.OnTriggerEnter2D` — **the sole trigger for damage resolution**. Sets
@@ -1235,6 +1247,37 @@ bool        isHeadHit      // set true when Hurtbox_Head fires; cleared after re
 `Blocked` or `Unblocked`. Never triggers resolution. Because `Hurtbox_Body` is expanded to
 encompass the block child during BLOCKING, the body contact always arrives in the same
 physics step — `LateFixedUpdate` reads a fully-resolved `blockResult` every time.
+
+`Hurtbox_Pierce.OnTriggerEnter2D` — routes to resolution identically to `Hurtbox_Body`.
+Only reachable by hitboxes on the pierce physics layer (see Physics Layer Matrix). Exists
+solely so `piercesDodgeIFrames = true` attacks still land when the body GameObject is inactive.
+
+#### I-Frames
+
+I-frames are implemented by deactivating `hurtboxBodyObject` via `SetInvulnerable`. With the
+GameObject off, no `OnTriggerEnter2D` callbacks fire — attacks physically whiff with no routing
+to `DamageCalculator` and no flags to check anywhere.
+
+**Who calls `SetInvulnerable`:**
+
+- **Dodge system** — calls `SetInvulnerable(true)` at `iFrameStartFrame` and
+  `SetInvulnerable(false)` at `iFrameEndFrame`, both defined on `DodgeSO`
+- **Attack-embedded i-frames** — animator fires `OnInvulnerableStart` / `OnInvulnerableEnd`
+  events on `HitboxEventRelay`; relay forwards to `SetInvulnerable`. Used for moves where
+  startup or active frames carry invulnerability by design (e.g. a reversal or dive kick).
+  Attacks with no embedded i-frames never fire these events — zero overhead.
+- **DOWN_RECOVERY** — get-up animation fires `OnInvulnerableStart` on frame 0 of DOWN_RECOVERY
+  and `OnInvulnerableEnd` a few frames later, preventing immediate re-combo off a knockdown.
+  Duration is authored per-actor in the animation clip.
+
+**Reference counting contract:** each `SetInvulnerable(true)` call must be paired with exactly
+one `SetInvulnerable(false)`. The body object re-activates only when the count reaches zero —
+two overlapping i-frame sources don't cancel each other early.
+
+**`piercesDodgeIFrames`:** attacks flagged with this field on `HitboxDataSO` collide with
+`Hurtbox_Pierce` (always active, separate physics layer) rather than `Hurtbox_Body`. They reach
+`HurtboxController` via the pierce path and resolve normally. Physics layer pairing for pierce
+attacks is specified in the Physics Layer Matrix (Priority 1 TODO).
 
 #### Damage Resolution
 
